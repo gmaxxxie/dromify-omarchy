@@ -116,22 +116,72 @@ def save_cache(devices: list[dict]) -> None:
     os.replace(tmp, CACHE_FILE)
 
 
+def _same_renderer(a: dict, b: dict) -> bool:
+    """Whether two discovery records describe one physical device.
+
+    Identity is the **AVTransport control endpoint**, not the description
+    document's URL. Measured on a Sony ZR7: it serves two description
+    documents (`MediaRenderer_SRS-ZR7.xml` from its own SSDP advertisement,
+    and `MediaRenderer.xml` at a conventional path), reports a *different*
+    UDN in each, and points both at the same control URL. The control URL is
+    what this backend actually drives, so two records that share it are one
+    device however they were found — and two renderers that share a host but
+    have their own control URLs are correctly kept apart.
+
+    The UDN is a fallback for a record from which the control URL could not be
+    read.
+    """
+    control_a = a.get("avTransportControlURL", "")
+    control_b = b.get("avTransportControlURL", "")
+    if control_a and control_b:
+        return control_a == control_b
+    udn_a, udn_b = a.get("udn", ""), b.get("udn", "")
+    return bool(udn_a) and udn_a == udn_b
+
+
+def _better_name(existing: str, incoming: str) -> str:
+    """Pick the more informative of two names for one device.
+
+    A device can be discovered under two names — its own SSDP friendlyName
+    ("SRS-ZR7 maxxie2") and the generic model name from a description document
+    ("Sony Audio"). A name that mentions the model is the device's own and
+    wins; otherwise the longer, more specific one does.
+    """
+    if not existing:
+        return incoming
+    if not incoming:
+        return existing
+    return existing if len(existing) >= len(incoming) else incoming
+
+
 def merge_devices(known: list[dict], found: list[dict]) -> list[dict]:
     """Add freshly discovered renderers to the known list, newest wins.
 
-    Keyed by control endpoint (`location`), which identifies one device
-    unambiguously even when a renderer reports different UUIDs in SSDP and in
-    its own description document — as Sony's do.
+    Records for one device are merged rather than listed separately, so a
+    speaker found on two description paths shows up once. The merge keeps
+    non-empty fields from both sides (so a name learned from SSDP survives a
+    sparser description document) while the newer record wins on the fields
+    the backend actually drives.
     """
-    merged: dict[str, dict] = {}
-    for device in known:
-        merged[dlna.dedupe_key(device)] = device
+    merged: list[dict] = [dict(device) for device in known]
     now = time.time()
     for device in found:
         entry = dict(device)
         entry["seen"] = now
-        merged[dlna.dedupe_key(device)] = entry
-    return list(merged.values())
+        for existing in merged:
+            if not _same_renderer(existing, entry):
+                continue
+            keep_name = _better_name(existing.get("name", ""), entry.get("name", ""))
+            filled = {key: value for key, value in existing.items()
+                      if value and not entry.get(key)}
+            filled.update(entry)
+            filled["name"] = keep_name
+            existing.clear()
+            existing.update(filled)
+            break
+        else:
+            merged.append(entry)
+    return merged
 
 
 def known_hosts() -> list[str]:

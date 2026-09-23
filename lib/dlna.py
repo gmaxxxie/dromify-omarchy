@@ -664,10 +664,10 @@ def dedupe_key(device: dict) -> str:
 
     A UDN alone is not enough: some Sony devices advertise one UUID in their
     SSDP messages (derived from the MAC) and report a different one in their
-    device description, so the same speaker shows up twice — once as
-    "SRS-ZR7 maxxie2" from SSDP and once as "Sony Audio" from the description.
-    Prefer the description's location (host + port + path identifies one
-    control endpoint unambiguously), falling back to the UDN.
+    own device description, so a single speaker shows up twice — once under
+    its SSDP name and once under its generic model name. The description's
+    location (host + port + path) identifies one control endpoint
+    unambiguously, so that is preferred, falling back to the UDN.
     """
     location = device.get("location", "")
     if location:
@@ -684,7 +684,42 @@ def describe_device(info: dict) -> dict:
     """
     name = info.get("friendlyName", "")
     model = info.get("modelName", "")
-    if (not name or name.lower() in ("sony audio", "audio")) and model:
+    manufacturer = info.get("manufacturer", "")
+    # Some devices put a generic brand string in friendlyName ("Sony Audio",
+    # "MediaRenderer") while the model carries the real product name, which
+    # makes two renderers from one brand indistinguishable in the picker.
+    # The test is "the friendlyName is a prefix of, or contained in, the
+    # manufacturer or model" — i.e. it names the brand rather than this
+    # device — which needs no per-vendor table:
+    #   friendlyName "Sony Audio" + manufacturer "Sony Corporation" -> generic
+    #   friendlyName "SRS-ZR7 maxxie2" + model "SRS-ZR7"            -> specific
+    #   friendlyName "Living Room"                                  -> specific
+    def is_generic(candidate: str) -> bool:
+        """Whether this friendlyName names the brand rather than the device.
+
+        Two signals, no vendor table:
+
+        * The friendlyName does not mention the model. A user-chosen name
+          almost always does not either, which is why the brand-word test
+          below has to pass as well.
+        * Its first word is the manufacturer's first word — "Sony Audio" for
+          a "Sony Corporation" device. That is the shape of a stock
+          brand-and-category default, as opposed to a name somebody set.
+        """
+        if not candidate:
+            return True
+        low = candidate.lower().strip()
+        if low in ("audio", "mediarenderer", "media renderer", "upnp av"):
+            return True
+        if model and model.lower() in low:
+            return False
+        if manufacturer:
+            first = manufacturer.lower().split()[0]
+            if low.split()[0] == first:
+                return True
+        return False
+
+    if is_generic(name) and model:
         name = model
     services = info.get("services", {})
     return {
