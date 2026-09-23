@@ -281,6 +281,25 @@ Panel {
             }
           }
 
+          // Output / cast. In the header rather than next to the library
+          // collapse toggle, because that row only exists while a track is
+          // loaded and the output choice has to be reachable before the first
+          // track — picking a speaker is how you decide where it will go.
+          PanelActionButton {
+            visible: nav.configured && !nav.showSettings
+            iconText: "󰓃"
+            tooltipText: nav.showOutput ? "Hide output options" : "Choose output"
+            foreground: nav.dlnaActive ? Color.accent : root.foreground
+            fontFamily: root.fontFamily
+            onClicked: {
+              nav.showOutput = !nav.showOutput
+              if (nav.showOutput) {
+                nav.refreshOutput(function() {})
+                if (nav.dlnaDevices.length === 0) nav.refreshDevices()
+              }
+            }
+          }
+
           PanelActionButton {
             iconText: nav.showSettings ? "󰁍" : "󰒓"
             tooltipText: nav.showSettings ? "Back to library" : "Server settings"
@@ -407,6 +426,20 @@ Panel {
           // opens, with no scrolling needed, rather than buried below a
           // long list.
           NowPlayingBar { visible: nav.currentSong; Layout.fillWidth: true }
+
+          // Output controls. Outside the collapse region below: folding the
+          // library away is about not burning vertical space on browsing, and
+          // "where is this coming out?" is exactly what a user still wants to
+          // answer while something plays.
+          //
+          // Hidden unless it is relevant — a user who never leaves the local
+          // output sees the panel exactly as before, and it appears on its own
+          // the moment a renderer is selected, so the active output is never
+          // a surprise.
+          OutputSelector {
+            visible: nav.configured && (nav.showOutput || nav.dlnaActive)
+            Layout.fillWidth: true
+          }
 
           // The accordion toggle for the section below, sitting in the
           // middle of what would otherwise be a plain separator — the line
@@ -1029,6 +1062,257 @@ Panel {
         fontFamily: root.fontFamily
         size: Style.space(20)
         onClicked: nav.toggleFavorite(itemRow.item)
+      }
+    }
+  }
+
+  // --- output / cast selector --------------------------------------------------
+  // One collapsible block listing Local and every discovered renderer. Kept
+  // inside this file because it is pure presentation over shared Service state
+  // (the same reason ProfileRow lives here), and built from the panel's own
+  // CursorSurface/PanelActionButton components rather than a new framework.
+  component OutputSelector: ColumnLayout {
+    id: outputSection
+    spacing: Style.space(6)
+
+    readonly property string activeLabel: {
+      if (nav.dlnaActive) return nav.dlnaRenderer !== "" ? nav.dlnaRenderer : "DLNA renderer"
+      return "This Computer"
+    }
+    readonly property bool busy: nav.discovering
+    // "This Computer" is selected when local; a renderer row is selected when
+    // its UDN matches what the backend reported. While a switch is still in
+    // flight, the clicked row is shown as selected so the UI does not lag the
+    // click.
+    function isRendererSelected(device) {
+      if (!nav.dlnaActive) return false
+      if (nav.selectedDevice !== "" && nav.selectedDevice === device.udn) return true
+      return nav.dlnaRenderer !== "" && nav.dlnaRenderer === device.name
+    }
+
+    RowLayout {
+      Layout.fillWidth: true
+      spacing: Style.space(6)
+
+      Text {
+        textFormat: Text.PlainText
+        text: "Output"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      // What is actually playing, at a glance, without expanding the block.
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        text: outputSection.activeLabel
+        color: nav.dlnaActive ? Color.accent : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      // Connection / transport state, only meaningful once a renderer is live.
+      Text {
+        textFormat: Text.PlainText
+        visible: nav.dlnaActive
+        text: Model.transportStateLabel(nav.dlnaState, nav.playing, nav.paused)
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      // The expanded block's own collapse control. The header carries the
+      // toggle that opens it (reachable before any track is loaded); this one
+      // closes it from where the user already is.
+      PanelActionButton {
+        visible: nav.dlnaActive && !nav.discovering
+        iconText: nav.showOutput ? "󰅀" : "󰅂"
+        tooltipText: nav.showOutput ? "Hide output options" : "Choose output"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        size: Style.space(20)
+        onClicked: nav.showOutput = !nav.showOutput
+      }
+    }
+
+    ColumnLayout {
+      visible: nav.showOutput
+      Layout.fillWidth: true
+      spacing: Style.space(4)
+
+      OutputRow {
+        label: "This Computer"
+        subtitle: "Play through mpv on this machine"
+        selected: !nav.dlnaActive
+        onActivated: nav.selectLocalOutput(function() {})
+      }
+
+      Repeater {
+        model: nav.dlnaDevices
+        delegate: OutputRow {
+          required property var modelData
+          label: modelData.name
+          subtitle: [modelData.manufacturer, modelData.model].filter(function(s) { return s && s !== "" }).join(" · ")
+          selected: outputSection.isRendererSelected(modelData)
+          onActivated: nav.selectDlnaOutput(modelData.udn, function(ok, err) {
+            if (!ok) nav.outputError = err
+          })
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: nav.dlnaDevices.length === 0
+        Layout.fillWidth: true
+        Layout.leftMargin: Style.space(8)
+        text: nav.discovering ? "Looking for renderers…" : "No DLNA renderers found on this network"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: nav.outputError !== ""
+        Layout.fillWidth: true
+        Layout.leftMargin: Style.space(8)
+        text: nav.outputError
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
+      RowLayout {
+        Layout.fillWidth: true
+        Layout.leftMargin: Style.space(8)
+        spacing: Style.space(6)
+
+        PanelActionButton {
+          iconText: "󰑐"
+          tooltipText: "Refresh devices"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          size: Style.space(20)
+          enabled: !nav.discovering
+          onClicked: nav.refreshDevices()
+        }
+        Text {
+          textFormat: Text.PlainText
+          text: nav.discovering ? "Searching…" : "Refresh devices"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          Layout.fillWidth: true
+        }
+        // Offered only after a normal sweep came back empty: it opens a
+        // connection to every host on the subnet, which is not something to
+        // invite when the ordinary discovery already worked.
+        PanelActionButton {
+          visible: nav.dlnaDevices.length === 0 && !nav.discovering
+          iconText: "󰍉"
+          tooltipText: "Sweep this network for renderers that do not answer SSDP"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          size: Style.space(20)
+          onClicked: nav.scanForDevices()
+        }
+      }
+    }
+  }
+
+  component OutputRow: CursorSurface {
+    id: outputRow
+    property string label: ""
+    property string subtitle: ""
+    property bool selected: false
+    // Declared explicitly (as the panel's other Repeater delegates do) so the
+    // delegate can be constructed from both a Repeater model and a plain
+    // inline instance; without it the Repeater's `required property var
+    // modelData` in the delegate body has nothing to bind to.
+    property var modelData: null
+    signal activated()
+
+    foreground: root.foreground
+    implicitHeight: rowLayout.implicitHeight + Style.space(8)
+    color: outputRow.selected ? fill : (outputRowArea.containsMouse ? fill : "transparent")
+    borderSpec: outputRow.selected ? Border.controlSpec("focus", root.foreground, Color.accent)
+                                   : Border.none()
+
+    MouseArea {
+      id: outputRowArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: outputRow.activated()
+    }
+
+    RowLayout {
+      id: rowLayout
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(8)
+      anchors.rightMargin: Style.space(8)
+      spacing: Style.space(8)
+
+      // A plain dot rather than a glyph: at this size an icon font's filled
+      // vs hollow circles are not reliably distinguishable, and the selected
+      // state has to read at a glance.
+      Rectangle {
+        Layout.alignment: Qt.AlignVCenter
+        width: Style.space(10)
+        height: Style.space(10)
+        radius: width / 2
+        color: "transparent"
+        border.width: 1
+        border.color: outputRow.selected ? Color.accent : root.dim
+
+        Rectangle {
+          anchors.centerIn: parent
+          visible: outputRow.selected
+          width: parent.width - Style.space(4)
+          height: parent.height - Style.space(4)
+          radius: width / 2
+          color: Color.accent
+        }
+      }
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        spacing: Style.space(1)
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          Layout.minimumWidth: 0
+          text: outputRow.label
+          color: outputRow.selected ? Color.accent : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: outputRow.selected
+          elide: Text.ElideRight
+        }
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          Layout.minimumWidth: 0
+          visible: outputRow.subtitle !== ""
+          text: outputRow.subtitle
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
       }
     }
   }

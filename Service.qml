@@ -27,6 +27,10 @@ Item {
   }
   readonly property string apiBin: pluginDir + "/bin/dromify-api"
   readonly property string playerBin: pluginDir + "/bin/dromify-player"
+  // Routes the transport verbs to whichever backend is selected (local mpv or
+  // a UPnP renderer). Everything below still calls `playerBin`; the router
+  // decides what that means, so adding a backend never touches this file.
+  readonly property string outputBin: pluginDir + "/bin/dromify-output"
 
   // dromify-api already caps what it will buffer from the server, but the
   // response comes back through a StdioCollector that would hold it a second
@@ -39,6 +43,26 @@ Item {
   property bool configured: false
   property string lastError: ""
   property bool connecting: false
+
+  // --- output routing -------------------------------------------------------
+  // "local" plays through mpv on this machine; "dlna" hands the stream URL to
+  // a UPnP MediaRenderer on the LAN, which fetches it from Navidrome itself.
+  // `output` mirrors what bin/dromify-output has on disk (it is the authority
+  // — the panel may be one of several things driving it).
+  property string output: "local"
+  property var dlnaDevices: []
+  property string dlnaRenderer: ""     // friendly name of the active renderer
+  property string dlnaState: ""        // NO_MEDIA_PRESENT | STOPPED | PLAYING | PAUSED_PLAYBACK | TRANSITIONING
+  // Which transport actions the renderer says it can do *right now*, straight
+  // from its GetCurrentTransportActions. Empty means "not asked yet"; a
+  // non-empty list that lacks "Pause" is why the panel greys Pause out on a
+  // device that genuinely cannot pause (the SRS-ZR7, while playing).
+  property var dlnaCapabilities: []
+  property bool discovering: false
+  property string outputError: ""
+
+  readonly property bool dlnaActive: output === "dlna"
+  readonly property bool searchingDevices: discovering
 
   // Transport state, refreshed by the poll timer while queueIndex >= 0.
   property bool playing: false
@@ -107,6 +131,10 @@ Item {
 
   property bool showSettings: false
   property bool addingServer: false
+  // Whether the Output section is expanded. Shows the renderer list inline
+  // under Now Playing rather than in a separate modal — one panel, no added
+  // navigation, and it can stay open while browsing.
+  property bool showOutput: false
 
   // Keyboard/mouse cursor. Shared for the same reason as the rest of this
   // section — moving the cursor on one screen's panel is the same action
@@ -598,14 +626,30 @@ Item {
   // carry the Subsonic salt+token, so they go over stdin, never argv (see
   // _runWithSecret). Titles are forced onto a single line — they're only a
   // cosmetic force-media-title, and a newline would desync the pairing.
-  function _queuePayload(songs, urls) {
-    var lines = []
+  function _queuePayload(songs, urls, startIndex) {
+    // One JSON document, not newline-paired fields: the local backend only
+    // needs url + a display title, but a DLNA backend also has to build DIDL
+    // metadata and decide whether the renderer can play the source codec at
+    // all — so it needs the whole song record. `title` stays
+    // Model.nowPlayingLabel's short form (mpv bakes it into the playlist
+    // entry; the renderer shows it in its own display).
+    var tracks = []
     for (var i = 0; i < urls.length; i++) {
-      var title = songs[i] ? Model.nowPlayingLabel(songs[i]) : ""
-      lines.push(urls[i])
-      lines.push(String(title).replace(/[\r\n]+/g, " "))
+      var song = songs[i] || {}
+      tracks.push({
+        id: String(song.id || ""),
+        url: urls[i],
+        title: String(Model.nowPlayingLabel(song)).replace(/[\r\n]+/g, " "),
+        artist: String(song.artist || ""),
+        album: String(song.album || ""),
+        suffix: String(song.suffix || ""),
+        contentType: String(song.contentType || ""),
+        duration: Number(song.duration) || 0,
+        size: Number(song.size) || 0,
+        bitRate: Number(song.bitRate) || 0
+      })
     }
-    return lines.join("\n")
+    return JSON.stringify({ start: Number(startIndex) || 0, tracks: tracks })
   }
 
   // Plays `songs[startIndex]`, queuing the rest of `songs` behind it as the
@@ -629,14 +673,27 @@ Item {
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
       _runWithSecret(playQueueProcess,
-                     [playerBin, "load-queue", String(startIndex), String(urls.length)],
-                     _queuePayload(songs, urls),
-                     function() {
+                     [outputBin, "load-queue", String(startIndex), String(urls.length)],
+                     _queuePayload(songs, urls, startIndex),
+                     function(data, err) {
         if (gen !== _playGen) return
         loading = false
+        if (err) { outputError = err; lastError = err; paused = true; playing = false; return }
+        if (data && data.ok === false) {
+          // The backend refused the track (a renderer-side fault, an
+          // unreachable stream). Report it instead of showing a pause button
+          // over silence.
+          outputError = data.error || "could not start playback"
+          lastError = outputError
+          playing = false
+          paused = true
+          return
+        }
+        outputError = ""
         paused = false
         playing = true
         pollTimer.restart()
+        pollNow()
       })
       _apiGet(["scrobble.view", "id=" + songs[startIndex].id, "submission=false"], function() {})
     })
@@ -644,7 +701,11 @@ Item {
 
   function togglePause() {
     if (queueIndex < 0) return
-    _run(playerCtlProcess, [playerBin, "toggle-pause"], function() { pollNow() })
+    // A renderer that reports no Pause action (the SRS-ZR7 while playing) is
+    // not asked: the panel disables the button, and this guard is what keeps a
+    // keyboard shortcut or a media key from bypassing that.
+    if (dlnaActive && !supportsPause) { outputError = "this renderer cannot pause"; return }
+    _run(playerCtlProcess, [outputBin, "toggle-pause"], function() { pollNow() })
   }
 
   // These just nudge mpv's own playlist ("weak", so running off either end
@@ -654,17 +715,17 @@ Item {
   // carries its own correct one, baked in when the queue was loaded.
   function next() {
     if (queue.length === 0) return
-    _run(playerCtlProcess, [playerBin, "next"], function() { pollNow() })
+    _run(playerCtlProcess, [outputBin, "next"], function() { pollNow() })
   }
 
   function previous() {
     if (queue.length === 0) return
-    _run(playerCtlProcess, [playerBin, "previous"], function() { pollNow() })
+    _run(playerCtlProcess, [outputBin, "previous"], function() { pollNow() })
   }
 
   function cycleRepeat() {
     repeatMode = repeatMode === "off" ? "all" : (repeatMode === "all" ? "one" : "off")
-    _run(playerCtlProcess, [playerBin, "set-repeat", repeatMode], function() {})
+    _run(playerCtlProcess, [outputBin, "set-repeat", repeatMode], function() {})
   }
 
   function toggleShuffle() {
@@ -722,8 +783,8 @@ Item {
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
       _runWithSecret(playQueueProcess,
-                     [playerBin, "reorder-tail", String(urls.length)],
-                     _queuePayload(tail, urls),
+                     [outputBin, "reorder-tail", String(urls.length)],
+                     _queuePayload(newQueue, urls, newIndex),
                      function() {
         if (gen !== _playGen) return
         loading = false
@@ -733,13 +794,14 @@ Item {
 
   function seekFraction(fraction) {
     if (duration <= 0) return
+    if (dlnaActive && !supportsSeek) { outputError = "this renderer cannot seek"; return }
     var secs = Math.max(0, Math.min(duration, fraction * duration))
-    _run(playerCtlProcess, [playerBin, "seek", String(Math.round(secs))], function() {})
+    _run(playerCtlProcess, [outputBin, "seek", String(Math.round(secs))], function() { pollNow() })
   }
 
   function setVolume(v) {
     volume = v
-    _run(playerCtlProcess, [playerBin, "volume", String(Math.round(v))], function() {})
+    _run(playerCtlProcess, [outputBin, "volume", String(Math.round(v))], function() {})
   }
 
   function stopPlayback() {
@@ -750,26 +812,45 @@ Item {
     paused = true
     position = 0
     duration = 0
-    _run(playerCtlProcess, [playerBin, "stop"], function() {})
+    _run(playerCtlProcess, [outputBin, "stop"], function() {})
   }
 
   function pollNow() {
-    if (queueIndex < 0 || statusPollProcess.running) return
+    if (!dlnaActive && queueIndex < 0) return
+    if (statusPollProcess.running) return
     // Tags this poll with the play generation active right now, so if a
-    // newer playFrom starts before this poll's `dromify-player status`
-    // subprocess returns, the (by then stale) result gets discarded instead
-    // of applied — see the onExited handler below for why that matters.
+    // newer playFrom starts before this poll's `status` subprocess returns,
+    // the (by then stale) result gets discarded instead of applied — see the
+    // onExited handler below for why that matters.
     statusPollProcess._gen = _playGen
-    statusPollProcess.command = [playerBin, "status"]
+    statusPollProcess.command = [outputBin, "status"]
     statusPollProcess.running = true
   }
 
+  // Poll cadence is per-backend and, in DLNA mode, per-state: every poll is
+  // two SOAP round-trips over Wi-Fi to a small embedded device, so hammering
+  // a paused renderer at 800ms would be pure noise. The renderer stays the
+  // authority either way; this only decides how often we ask it.
   Timer {
     id: pollTimer
     interval: 800
     repeat: true
     running: false
     onTriggered: root.pollNow()
+  }
+
+  // Re-evaluates the cadence whenever the transport state changes.
+  onDlnaStateChanged: root._syncPollInterval()
+  onOutputChanged: root._syncPollInterval()
+
+  function _syncPollInterval() {
+    if (!dlnaActive) {
+      pollTimer.interval = 800
+      return
+    }
+    if (dlnaState === "PLAYING" || dlnaState === "TRANSITIONING") pollTimer.interval = 1000
+    else if (dlnaState === "PAUSED_PLAYBACK") pollTimer.interval = 3000
+    else pollTimer.interval = 8000
   }
 
   Process {
@@ -808,19 +889,41 @@ Item {
       root.audioCodec = data.audioCodec || ""
       root.audioBitrate = Number(data.audioBitrate) || 0
 
-      // mpv's playlist-pos is the one source of truth for "what's playing" —
-      // it moves the same way whether the track changed because of an
-      // in-app button, a media key, `playerctl`, or mpv just finishing a
-      // track and auto-advancing on its own. Whenever it moves, follow it
-      // and scrobble the track that just finished / announce the new one as
-      // "now playing" — no need to relabel mpv's title here too, since
-      // every entry already carries its own correct one from load-queue.
+      // Backend-specific extras. `output` is re-read on every poll because
+      // bin/dromify-output owns that choice; if it changed underneath us
+      // (another panel, a shell command), the panel follows rather than
+      // disagreeing with reality.
+      if (data.output && data.output !== root.output) root.output = data.output
+      if (data.renderer !== undefined) root.dlnaRenderer = data.renderer || root.dlnaRenderer
+      if (data.state !== undefined) root.dlnaState = data.state || ""
+      if (data.capabilities) root.dlnaCapabilities = data.capabilities
+      if (data.error !== undefined) root.outputError = data.error || ""
+
+      // Scrobble a track the backend saw finish. The DLNA backend reports the
+      // id explicitly (it cannot scrobble itself — these scripts hold no
+      // credentials); the local backend has none, so this is a no-op there.
+      if (data.finishedId) {
+        root._apiGet(["scrobble.view", "id=" + data.finishedId, "submission=true"], function() {})
+      }
+
+      // The backend's index is the one source of truth for "what's playing" —
+      // for mpv that is its own playlist-pos, and it moves the same way
+      // whether the track changed because of an in-app button, a media key,
+      // `playerctl`, or mpv finishing a track on its own. For a renderer it is
+      // the queue entry whose URI the device reports as current, which
+      // likewise covers a button, the speaker's own Next, or a preloaded
+      // hand-off. Whenever it moves, follow it and announce the new track.
       var pos = data.playlistPos !== undefined ? Number(data.playlistPos) : -1
       if (pos >= 0 && pos !== root.queueIndex && pos < root.queue.length) {
         var finishedSong = root.currentSong
         root.queueIndex = pos
-        if (finishedSong) _apiGet(["scrobble.view", "id=" + finishedSong.id, "submission=true"], function() {})
-        if (root.currentSong) _apiGet(["scrobble.view", "id=" + root.currentSong.id, "submission=false"], function() {})
+        // Locally the finished track is the one we were on; over DLNA the
+        // backend knows better and has already reported it via finishedId, so
+        // only fall back to this when it did not.
+        if (finishedSong && !data.finishedId) {
+          root._apiGet(["scrobble.view", "id=" + finishedSong.id, "submission=true"], function() {})
+        }
+        if (root.currentSong) root._apiGet(["scrobble.view", "id=" + root.currentSong.id, "submission=false"], function() {})
       }
     }
   }
@@ -1039,7 +1142,8 @@ Item {
     property string _secret: ""
     stdinEnabled: true
     running: false
-    stdout: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector { id: playQueueOut; waitForEnd: true }
+    stderr: StdioCollector { id: playQueueErr; waitForEnd: true }
     onStarted: {
       if (playQueueProcess._secret !== "") {
         playQueueProcess.write(playQueueProcess._secret + "\n")
@@ -1049,7 +1153,17 @@ Item {
     onExited: function(exitCode) {
       playQueueProcess._secret = ""
       var cb = playQueueProcess._cb; playQueueProcess._cb = null
-      if (cb) cb()
+      if (!cb) return
+      if (exitCode !== 0) {
+        cb(null, String(playQueueErr.text || "playback failed").replace(/^dromify-(player|dlna|output):\s*/, "").trim())
+        return
+      }
+      // A backend can refuse a queue — a renderer that rejects the stream, an
+      // unreachable one — so its answer is parsed and reported rather than
+      // assumed to have worked.
+      var data = null
+      try { data = JSON.parse(playQueueOut.text) } catch (e) { /* non-JSON is fine */ }
+      cb(data, "")
     }
   }
 
@@ -1057,19 +1171,191 @@ Item {
   // configured, rather than waiting for the first track click. mpv's cold
   // start can take a couple of seconds; doing it here means that wait
   // happens quietly up front instead of stalling — and shrinking the window
-  // for — the first real playFrom.
+  // for — the first real playFrom. Skipped while the DLNA output is active:
+  // there is no mpv to warm up, and starting one would put a stray MPRIS
+  // player on the bus.
   Process {
     id: warmupProcess
     running: false
     stdout: StdioCollector { waitForEnd: true }
   }
   function _warmUpPlayer() {
-    if (warmupProcess.running) return
-    warmupProcess.command = [playerBin, "ensure"]
+    if (warmupProcess.running || dlnaActive) return
+    warmupProcess.command = [outputBin, "ensure"]
     warmupProcess.running = true
   }
 
+  // --- output selection ----------------------------------------------------
+  // The renderer list is refreshed on demand (panel open, the Refresh button),
+  // never on a timer: each sweep is a burst of SSDP probes and a handful of
+  // HTTP fetches, which is not something to do in the background.
+
+  // Which renderer the user last clicked, for the radio button's highlight
+  // while the selection round-trips through the backend.
+  property string selectedDevice: ""
+
+  readonly property bool supportsPause: dlnaCapabilities.length === 0 || dlnaCapabilities.indexOf("Pause") >= 0
+  readonly property bool supportsSeek: dlnaCapabilities.length === 0 || dlnaCapabilities.indexOf("Seek") >= 0
+  readonly property bool supportsNext: dlnaCapabilities.length === 0 || dlnaCapabilities.indexOf("Next") >= 0
+  readonly property bool supportsPrevious: dlnaCapabilities.length === 0 || dlnaCapabilities.indexOf("Previous") >= 0
+
+  function refreshOutput(callback) {
+    _run(outputProcess, [outputBin, "output"], function(data, err) {
+      if (data && data.output) output = data.output
+      if (callback) callback(output, err)
+    })
+  }
+
+  function refreshDevices(callback) {
+    discovering = true
+    outputError = ""
+    _run(deviceProcess, [outputBin, "devices", "--json"], function(data, err) {
+      discovering = false
+      var devices = (data && data.devices) ? data.devices : []
+      dlnaDevices = devices
+      if (devices.length === 0 && err) outputError = err
+      if (callback) callback(devices, err || "")
+    })
+  }
+
+  // Scans the local /24s for a renderer that does not answer SSDP at all.
+  // Explicitly user-triggered (the panel offers it only after a normal sweep
+  // came back empty) because it opens a connection to every host on the subnet.
+  function scanForDevices(callback) {
+    discovering = true
+    _run(deviceScanProcess, [outputBin, "devices", "--json", "--scan"], function(data, err) {
+      discovering = false
+      var devices = (data && data.devices) ? data.devices : []
+      dlnaDevices = devices
+      if (callback) callback(devices, err || "")
+    })
+  }
+
+  function clearPlaybackState() {
+    queue = []
+    queueIndex = -1
+    playing = false
+    paused = true
+    position = 0
+    duration = 0
+    audioCodec = ""
+    audioBitrate = 0
+    pollTimer.stop()
+  }
+
+  function selectLocalOutput(callback) {
+    _run(outputProcess, [outputBin, "output", "local"], function(data, err) {
+      output = "local"
+      dlnaCapabilities = []
+      dlnaState = ""
+      dlnaRenderer = ""
+      selectedDevice = ""
+      outputError = ""
+      // A track playing on the renderer is not playing here, and the local
+      // queue is whatever mpv still has — which is nothing once the output
+      // switch has stopped it. Ask for a fresh snapshot rather than carrying
+      // the renderer's position over.
+      clearPlaybackState()
+      _warmUpPlayer()
+      if (callback) callback(!err, err || "")
+    })
+  }
+
+  function selectDlnaOutput(selector, callback) {
+    selectedDevice = String(selector)
+    _run(outputProcess, [outputBin, "output", "dlna", String(selector)], function(data, err) {
+      if (err || !data || !data.renderer) {
+        outputError = err || "could not select that renderer"
+        if (callback) callback(false, outputError)
+        return
+      }
+      output = "dlna"
+      dlnaRenderer = data.renderer.name || ""
+      dlnaCapabilities = data.capabilities || []
+      dlnaState = ""
+      outputError = ""
+      // The queue belongs to the backend, and the backend was just switched:
+      // nothing is playing until a track is chosen.
+      clearPlaybackState()
+      pollTimer.restart()
+      if (callback) callback(true, "")
+    })
+  }
+
+  Process {
+    id: outputProcess
+    property var _cb: null
+    running: false
+    stdout: StdioCollector { id: outputOut; waitForEnd: true }
+    stderr: StdioCollector { id: outputErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var cb = outputProcess._cb; outputProcess._cb = null
+      // bin/dromify-output prints one JSON object per line; selecting a
+      // renderer prints the renderer first and the acknowledgement second, so
+      // parse every line and keep the last one that parsed.
+      var data = null
+      var lines = String(outputOut.text || "").split("\n")
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim()
+        if (line === "") continue
+        try { var parsed = JSON.parse(line); if (parsed) data = parsed } catch (e) { /* skip */ }
+      }
+      if (exitCode !== 0) {
+        if (cb) cb(null, String(outputErr.text || "output switch failed").replace(/^dromify-(output|dlna|player):\s*/, "").trim())
+        return
+      }
+      if (cb) cb(data, "")
+    }
+  }
+
+  Process {
+    id: deviceProcess
+    property var _cb: null
+    running: false
+    stdout: StdioCollector { id: deviceOut; waitForEnd: true }
+    stderr: StdioCollector { id: deviceErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var cb = deviceProcess._cb; deviceProcess._cb = null
+      if (exitCode !== 0) {
+        if (cb) cb(null, String(deviceErr.text || "discovery failed").replace(/^dromify-(dlna|output):\s*/, "").trim())
+        return
+      }
+      if (cb) cb(root.parseDeviceList(deviceOut.text), "")
+    }
+  }
+
+  Process {
+    id: deviceScanProcess
+    property var _cb: null
+    running: false
+    stdout: StdioCollector { id: scanOut; waitForEnd: true }
+    stderr: StdioCollector { id: scanErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var cb = deviceScanProcess._cb; deviceScanProcess._cb = null
+      if (exitCode !== 0) {
+        if (cb) cb(null, String(scanErr.text || "scan failed").replace(/^dromify-(dlna|output):\s*/, "").trim())
+        return
+      }
+      if (cb) cb(root.parseDeviceList(scanOut.text), "")
+    }
+  }
+
+  function parseDeviceList(text) {
+    var data = null
+    var lines = String(text || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim()
+      if (line === "") continue
+      try { var parsed = JSON.parse(line); if (parsed && parsed.devices) data = parsed } catch (e) { /* skip */ }
+    }
+    return data
+  }
+
   Component.onCompleted: refreshStatus(function(data) {
-    if (data && data.configured) _warmUpPlayer()
+    // Read the persisted output choice, then only warm mpv up when it is the
+    // backend that will actually be used.
+    refreshOutput(function() {
+      if (data && data.configured && !root.dlnaActive) _warmUpPlayer()
+    })
   })
 }

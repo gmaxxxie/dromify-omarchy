@@ -117,6 +117,22 @@ function isStarred(item) {
   return !!(item && item.starred)
 }
 
+// A short human label for a UPnP renderer's transport state. The UPnP
+// vocabulary is its own thing (NO_MEDIA_PRESENT, PAUSED_PLAYBACK) and does not
+// belong in the panel verbatim; the fallback uses the boolean transport state
+// for the local backend, which has no `state` string of its own.
+function transportStateLabel(state, playing, paused) {
+  switch (String(state || "")) {
+    case "PLAYING": return "Playing"
+    case "PAUSED_PLAYBACK": return "Paused"
+    case "STOPPED": return "Stopped"
+    case "TRANSITIONING": return "Starting…"
+    case "NO_MEDIA_PRESENT": return "Idle"
+    case "NO_RENDERER": return "No renderer"
+    default: return playing ? "Playing" : (paused ? "Paused" : "")
+  }
+}
+
 // Just the title, trimmed to a plausible bar-pill length. This is baked
 // into mpv's per-entry force-media-title (see Service.qml's
 // _urlsWithTitles) rather than "Artist – Title" — the system media widget
