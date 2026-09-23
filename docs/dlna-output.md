@@ -42,12 +42,12 @@ Service.qml
 `bin/dromify-output` is a thin router: it forwards its argv/stdin to whichever
 backend the current output selection names, and its stdout is that backend's
 stdout. Service.qml therefore keeps calling the same verbs (`load-queue`,
-`next`, `status`, …) and only learns about "which backend" through a new
-`output` field in the status JSON. A future Chromecast/AirPlay backend is a new
-`dromify-output` target and nothing else.
+`next`, `status`, …) and learns about "which backend" through an `output` field
+in the status JSON. Adding a backend is a new `dromify-output` target and
+nothing else — no renderer-specific code in QML, no new UI framework.
 
 `dromify-dlna` holds the queue in its own state file for the same reason mpv
-holds it: next/previous/auto-advance need a queue, and the panel should not be
+holds one: next/previous/auto-advance need a queue, and the panel should not be
 the thing that decides what plays next.
 
 ## Stream URLs: why the renderer must fetch them itself
@@ -64,23 +64,100 @@ reachable *from the renderer*:
   plays the identical file over `http://…`. Its own `GetProtocolInfo` sink list
   contains no TLS-capable transport, and Sony's documentation for the device
   family says the same.
-- `bin/dromify-bridge` exists for exactly that case: a small, opt-in,
-  token-gated HTTP range proxy that fetches the authenticated Navidrome URL
-  itself and re-serves it over plain HTTP on the LAN interface. It is used
-  **only** when a direct fetch cannot work (https + a renderer that refuses
-  TLS), never as a default path.
+- `bin/dromify-bridge` exists for exactly that case: a small, token-gated HTTP
+  range proxy that fetches the authenticated Navidrome URL itself over TLS and
+  re-serves it over plain HTTP on the LAN interface. Every served path is a
+  random 32-hex token; the upstream URL never appears in a path, a log line or
+  an error, and the daemon binds one LAN address rather than `0.0.0.0`. It is
+  used **only** when a direct fetch cannot work (https + a renderer that
+  refuses TLS), never as a default path, and it idles out on its own.
+- `DROMIFY_ALLOW_INSECURE_LAN=1` is the other answer to the same problem:
+  plain `http://` to a private address, when the user says the network is
+  trusted. It is opt-in per shell and never a config default, because the
+  Subsonic salt+token is replayable. The two options are complementary — the
+  bridge keeps TLS on the wire, the flag drops it deliberately.
+
+## Discovery, and why it is not one M-SEARCH
+
+`dromify-dlna devices` runs three probes concurrently and merges what they
+find: multicast M-SEARCH, unicast M-SEARCH to hosts already known (from the
+cache, from the selected renderer, and from ARP), and a passive listen for
+SSDP `NOTIFY` advertisements. This is not belt-and-braces; on the network this
+was developed against:
+
+- The ZR7 answers a multicast M-SEARCH roughly **one time in six**. Most
+  sweeps see nothing from it while its HTTP side is perfectly responsive.
+- Another renderer on the same network only ever announces itself with
+  `NOTIFY` and never answers a probe.
+
+So results **accumulate** in a device cache instead of being replaced by each
+sweep — a sweep that misses a device must not make it disappear from the
+picker — and `dromify-dlna devices --scan` exists for a device whose SSDP
+responder is broken entirely: it sweeps the local `/24`s, narrowing to hosts
+that answer a TCP connect first so the sweep takes seconds rather than minutes.
+
+Identity is the **AVTransport control endpoint**, not the description URL and
+not the UDN. A ZR7 serves two description documents (`MediaRenderer_SRS-ZR7.xml`
+from its own SSDP advertisement and `MediaRenderer.xml` at a conventional path),
+reports a *different* UDN in each, and points both at the same control URL.
+Two records sharing a control URL are one device; two renderers sharing a host
+but having their own control URLs stay apart.
 
 ## Renderer state and the panel
 
 The renderer is the authority in DLNA mode too: `dromify-dlna status` returns
 `state`, `position`, `duration`, and the *index* it resolved by matching the
-renderer's `TrackURI` against its queue. Service.qml mirrors it the same way it
-mirrors mpv's `playlist-pos`, including scrobbling on a track change.
+`TrackURI` the device reports against its queue. Service.qml mirrors it the
+same way it mirrors mpv's `playlist-pos`, including scrobbling on a track
+change.
 
 Polling is adaptive (playing 1 s, paused 3 s, stopped/idle 8 s) rather than a
-fixed 800 ms, because every poll is two SOAP round-trips to the device.
+fixed 800 ms, because every poll is two SOAP round-trips to the device. mpv
+keeps its 800 ms locally.
 
-Capabilities are *read from the device* (`GetCurrentTransportActions`), not
-assumed: the SRS-ZR7 advertises `Stop,Next,Previous` while playing — no Pause,
-no Seek — so the panel disables those controls instead of pretending a command
-worked.
+Capabilities are *read from the device* (`GetCurrentTransportActions`), never
+assumed:
+
+- The ZR7 advertises `Stop,Next,Previous` while playing — no Pause, no Seek —
+  so the panel disables those controls instead of firing commands that fault.
+  (Its advertised set is not even stable between calls, which is a good
+  argument for reading it rather than caching it.)
+- Its `Previous` action returns success and does nothing, so the backend always
+  drives Previous from its own queue rather than delegating.
+- At the end of a stream with nothing preloaded it settles into
+  `PAUSED_PLAYBACK` sitting at the duration rather than reporting `STOPPED`, so
+  end-of-track is detected from position-vs-duration in either state.
+- `SetAVTransportURI` intermittently faults (501/716) on an action that
+  succeeds immediately after, so `start_track` retries once.
+- For a transcoded stream (no `Content-Length`) `TrackDuration` comes back as
+  nonsense — `596:31:23` for a 4-minute track — so the queue's own duration
+  from the Subsonic API wins when the two disagree.
+
+## Codecs
+
+The MIME declared in the DIDL `<res>` comes from the Subsonic API's own
+`contentType`, because the renderer validates what it receives against it — a
+`.dsf` guessed as `audio/dsd` gets rejected even though the extension suggests
+it.
+
+A format outside the DLNA baseline that renderers advertise but cannot play
+(DSD, APE) is requested from Navidrome as `?format=mp3` instead of being handed
+over to fail. Measured: a ZR7 lists `audio/dsd` in its sink list and rejects a
+DSF stream with fault 501. Everything it does support — FLAC, WAV, ALAC/M4A,
+MP3, AAC — is streamed as-is with no intermediate decoding. When the sink list
+is unknown, the original is tried first; the fallback is only taken on evidence.
+
+## What does not survive without Dromify
+
+The renderer fetches the stream itself, so playback continues with the panel
+closed, the shell restarted, or Dromify uninstalled. The **queue** does not:
+preloading the next track and catching the end of one is Dromify's job, and a
+device that has stopped at the end of a stream will not start the next one on
+its own.
+
+MPRIS is the known gap. `mpv-mpris` is the local player's MPRIS face; in DLNA
+mode mpv is stopped (deliberately — a stale player advertising itself would be
+worse), so `playerctl` and the hardware media keys control nothing rather than
+the renderer. A small MPRIS bridge that proxies to `dromify-dlna` is feasible —
+`python-dbus` is already a dependency of the desktop — but it is a separate
+service with its own lifecycle, and it is not part of this change.

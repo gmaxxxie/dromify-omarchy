@@ -172,10 +172,19 @@ broken:
 bin/dromify-dlna devices --scan
 ```
 
+### Media keys
+
+Hardware media keys and `playerctl` control the **local** player, through
+`mpv-mpris`. While a renderer is active mpv is stopped on purpose (a stale
+MPRIS player advertising itself is worse than none), so media keys control
+nothing rather than the speaker. `docs/dlna-output.md` describes what a bridge
+for that would take.
+
 ### Debugging
 
 ```
 DROMIFY_DLNA_DEBUG=1 bin/dromify-dlna devices
+DROMIFY_DLNA_DEBUG=1 bin/dromify-dlna status
 ```
 
 prints discovery traffic, the selected renderer, every SOAP action and its
