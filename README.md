@@ -33,6 +33,9 @@ Omarchy theme, not the app's.
   ![Collapsed to Now Playing](docs/minimized.png)
 - Streams through `mpv`, so it's a normal MPRIS player: media keys,
   `playerctl`, and Omarchy's Media widget all control it
+- **Cast to a UPnP/DLNA renderer** — send the stream to a network speaker
+  (a Sony SRS-ZR7 and friends) instead of this machine. The renderer fetches
+  the audio straight from your server; Dromify is only the control point
 - One session shared across every monitor — same queue and now-playing
   wherever you open the bar
 - Keyboard-driven: `j`/`k` to move, `Enter` to activate, `/` to search, `f`
@@ -59,6 +62,11 @@ All in Arch's official repos, most already on a stock Omarchy install:
 - `wl-clipboard` — ships with Omarchy; used by the copy-password button
 - `secret-tool` (`libsecret`) and a running Secret Service — GNOME Keyring
   or KWallet
+- `python3` — for the DLNA output and the cover-art helper; both are
+  standard library only, no pip packages
+
+The DLNA output needs nothing installed beyond `python3`: discovery, the
+SOAP control point, and the optional stream bridge are all in this repo.
 
 ## Install
 
@@ -118,6 +126,62 @@ tailnet, no port-forwarding, cert auto-renewed, config persists across
 reboots. A reverse proxy with a Let's Encrypt cert (Caddy does this
 automatically) or Navidrome's own `ND_TLSCERT` / `ND_TLSKEY` work equally well.
 
+## Casting to a DLNA renderer
+
+The speaker icon in the panel header opens **Output**. *This Computer* is the
+default and plays through mpv exactly as before; any UPnP MediaRenderer found
+on the LAN is listed below it, with **Refresh devices** to sweep again.
+
+Pick a renderer and the next track you play goes to it. Your server serves the
+audio directly — the speaker does its own HTTP fetch — so nothing is
+transcoded or relayed through this machine unless the renderer forces it.
+
+Things worth knowing:
+
+- **The panel asks the renderer what it can do.** Some devices cannot pause or
+  seek while playing (a Sony SRS-ZR7 reports `Stop,Next,Previous` and nothing
+  else). Those buttons are disabled rather than pretending the command worked.
+- **Formats the renderer cannot play are requested as MP3.** The device's own
+  `GetProtocolInfo` decides this. A ZR7 advertises DSD in its sink list and
+  still rejects a DSF stream, so the known-unplayable formats are transcoded
+  rather than handed over to fail. Everything it does support — FLAC, WAV,
+  ALAC/M4A, MP3 — is streamed as-is.
+- **HTTPS servers need the stream bridge.** The Subsonic token must not cross
+  a network in the clear, so `dromify-api` requires `https://` for anything
+  that is not this machine. A renderer that speaks no TLS cannot fetch an
+  `https://` URL at all, so `bin/dromify-bridge` fetches it over TLS and
+  re-serves it on the LAN over plain HTTP. It stays opt-out-able
+  (`dromify-dlna configure --bridge off`) and only ever starts when needed.
+- **The renderer keeps playing if Dromify goes away**, because it is fetching
+  the stream itself. The *queue* does not: preloading the next track and
+  catching the end of one is Dromify's job.
+
+Playback continues with the panel closed, and with the shell restarted; it
+stops if the renderer loses power or is switched to another input.
+
+### If your renderer is not found
+
+Some devices answer SSDP unreliably — a Sony SRS-ZR7 on this network responds
+to roughly one multicast probe in six — so discovery sends several probes and
+keeps previously found devices even when a sweep comes back empty. If a device
+never shows up at all, the **scan** button (shown only when a normal sweep
+found nothing) sweeps the local `/24` for a renderer whose SSDP responder is
+broken:
+
+```
+bin/dromify-dlna devices --scan
+```
+
+### Debugging
+
+```
+DROMIFY_DLNA_DEBUG=1 bin/dromify-dlna devices
+```
+
+prints discovery traffic, the selected renderer, every SOAP action and its
+result, and renderer state transitions. Passwords and authenticated stream
+URLs are redacted — query values are replaced with `…`.
+
 ## Remove
 
 ```
@@ -133,22 +197,31 @@ secret-tool clear service omarchy-dromify
 
 ## How it's built
 
-Plain Quickshell QML (`Panel.qml`, `Service.qml`) over two small bash
-scripts:
+Plain Quickshell QML (`Panel.qml`, `Service.qml`) over a few small helpers:
 
 - `bin/dromify-api` — Subsonic REST client: server profiles, browsing,
   search, favourites, cover art, stream URLs.
 - `bin/dromify-player` — drives one persistent `mpv` instance over its JSON
   IPC socket. mpv's playlist is the queue, so next/previous work through
   MPRIS and hardware media keys.
+- `bin/dromify-dlna` (+ `lib/dlna.py`) — the UPnP/DLNA control point:
+  discovery, device descriptions, AVTransport. Standard library only.
+- `bin/dromify-bridge` — token-gated HTTP range proxy, started only when a
+  renderer cannot fetch an `https://` stream URL itself.
+- `bin/dromify-output` — routes the transport verbs to whichever backend is
+  active, so the QML side never has to know which one that is.
 
-Both run standalone:
+All of them run standalone:
 
 ```
 echo demo | bin/dromify-api configure Demo https://demo.navidrome.org demo
 bin/dromify-api get getRandomSongs.view size=5
 bin/dromify-player status
+bin/dromify-output devices
 ```
+
+See [docs/dlna-output.md](docs/dlna-output.md) for how the DLNA output is
+put together and the measurements that shaped it.
 
 ## Licence
 
