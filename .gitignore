@@ -1,3 +1,8 @@
 *.swp
 *~
 .DS_Store
+
+# Python bytecode from the bundled helpers (dromify-dlna, dromify-bridge,
+# lib/dlna.py) — generated on whatever interpreter runs them, never committed.
+__pycache__/
+*.pyc
