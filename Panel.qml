@@ -40,6 +40,10 @@ Panel {
   readonly property var nav: (bar && bar.shell && bar.shell.firstPartyServiceFor("tallahootie.dromify")) || _localNav
   Service { id: _localNav }
 
+  // The plain-http opt-in lives on the Service (it owns the options file);
+  // the panel only reads it for the toggle's label.
+  readonly property bool insecureLanOn: nav.allowInsecureLan
+
   // --- per-instance keyboard focus / scroll ---------------------------------
   // Everything about *what* is being browsed (tabs, drill-down, search,
   // settings, cursor position) lives on the shared `nav` now — see
@@ -345,6 +349,60 @@ Panel {
             onClicked: nav.addingServer = !nav.addingServer
           }
 
+          // Trusted-local-network opt-in. Only shown when it is actually
+          // needed: the active server is plain http:// on this network, which
+          // dromify-api refuses by default because the Subsonic salt+token is
+          // a replayable credential. With it off nothing plays and the reason
+          // is otherwise invisible — the panel just looks broken.
+          ColumnLayout {
+            visible: nav.activeProfile && nav.activeProfile.serverURL
+                     && String(nav.activeProfile.serverURL).indexOf("http://") === 0
+                     && !nav.isLoopbackServer(nav.activeProfile.serverURL)
+            Layout.fillWidth: true
+            spacing: Style.space(4)
+
+            PanelSeparator { foreground: root.foreground; Layout.fillWidth: true }
+
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                spacing: Style.space(1)
+
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  text: "Allow plain HTTP on this network"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  wrapMode: Text.WordWrap
+                  text: insecureLanOn
+                    ? "On. " + String(nav.activeProfile.serverURL).replace(/\/$/, "") + " is trusted; nothing plays over https from it."
+                    : "Off. " + String(nav.activeProfile.serverURL).replace(/\/$/, "") + " will refuse to play until this is on, because its login token is replayable."
+                  color: insecureLanOn ? Color.accent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              PanelActionButton {
+                iconText: insecureLanOn ? "󰄬" : "󰅖"
+                tooltipText: insecureLanOn ? "Turn off (will stop playback from this server)" : "Turn on for this trusted network"
+                foreground: insecureLanOn ? Color.accent : root.foreground
+                fontFamily: root.fontFamily
+                onClicked: nav.toggleAllowInsecureLan()
+              }
+            }
+          }
+
           ColumnLayout {
             visible: nav.addingServer || nav.profiles.length === 0
             Layout.fillWidth: true
@@ -439,6 +497,20 @@ Panel {
           OutputSelector {
             visible: nav.configured && (nav.showOutput || nav.dlnaActive)
             Layout.fillWidth: true
+          }
+
+          // Whatever last went wrong, where the user can see it. Until now a
+          // refused request showed as silence: nothing played and nothing
+          // explained why.
+          Text {
+            textFormat: Text.PlainText
+            visible: nav.configured && nav.outputError !== "" && !nav.showSettings
+            Layout.fillWidth: true
+            text: nav.outputError
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           // The accordion toggle for the section below, sitting in the

@@ -34,6 +34,13 @@ DLNA="$HERE/dromify-dlna"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dromify"
 OUTPUT_FILE="$STATE_DIR/output"
 
+# Panel-set options (see bin/dromify-options). Loaded rather than parsed so the
+# flag reaches this script *and* every helper it goes on to spawn, which is the
+# whole point — the panel cannot set its own process environment.
+OPTIONS_SH="$HERE/../lib/options.sh"
+# shellcheck disable=SC1090
+[[ -f "$OPTIONS_SH" ]] && . "$OPTIONS_SH" && dromify_load_options
+
 fail() { echo "dromify-output: $*" >&2; exit 1; }
 
 # Reads the queue JSON from stdin and prints mpv's url/title line pairs.
@@ -95,6 +102,7 @@ status() {
     || "$PLAYER" status
 }
 
+verb=""
 case "${1:-}" in
   output)
     shift
@@ -129,21 +137,17 @@ case "${1:-}" in
         ;;
     esac
     ;;
-  load-queue)
+  load-queue | reorder-tail)
+    verb="$1"
     shift
     if [[ "$(current_output)" == "dlna" ]]; then
-      exec python3 "$DLNA" load-queue "$@"
+      exec python3 "$DLNA" "$verb" "$@"
     fi
     # The count argument is preserved: dromify-player validates it against the
     # payload it is about to read, which is exactly the check worth keeping.
-    exec "$PLAYER" load-queue "$@" < <(queue_json_to_pairs)
-    ;;
-  reorder-tail)
-    shift
-    if [[ "$(current_output)" == "dlna" ]]; then
-      exec python3 "$DLNA" reorder-tail "$@"
-    fi
-    exec "$PLAYER" reorder-tail "$@" < <(queue_json_to_pairs)
+    # Process substitution, not a pipe, so the child gets the payload as its
+    # stdin and `exec` keeps the exit status it reports.
+    exec "$PLAYER" "$verb" "$@" < <(queue_json_to_pairs)
     ;;
   devices)
     shift
