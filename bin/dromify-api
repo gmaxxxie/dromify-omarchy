@@ -57,26 +57,6 @@ MAX_CONFIG_BYTES=$((1024 * 1024))       # our own config.json when we read it
 # home server via `tailscale serve`).
 LOOPBACK_HOSTS=" localhost 127.0.0.1 ::1 [::1] "
 
-# Escape hatch for a server on a trusted local network, set to 1 to allow
-# plain http:// to a private address (RFC1918 / link-local / CGNAT / .local).
-# The salt+token is replayable, so this really does put a credential on the
-# wire — it is opt-in per shell, never a config default, and never enables a
-# public address. A DLNA renderer that speaks no TLS (a Sony SRS-ZR7, for
-# instance) cannot be handed an https stream URL at all, which is the case
-# this exists for; bin/dromify-bridge is the alternative that keeps TLS.
-ALLOW_INSECURE_LAN=""
-
-# True for an address that cannot leave the local network.
-is_private_host() {
-  local h="$1"
-  case "$h" in
-    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
-    169.254.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 0 ;;
-    *.local) return 0 ;;
-  esac
-  return 1
-}
-
 # The plugin used to be called "Dromarchy" (before it took the Dromify
 # name to match the iOS app) - these are where its config/keyring entries
 # lived, so a rename doesn't force everyone to reconfigure their server.
@@ -91,18 +71,6 @@ need jq
 need curl
 need md5sum
 need python3   # runs the bundled dromify-fsafe helper (see fsafe() below)
-
-# Panel-set options (see lib/options.sh). Sourced before ALLOW_INSECURE_LAN is
-# read below, so the settings view's toggle reaches here even though the shell
-# process itself was not launched with the variable.
-OPTIONS_SH="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/../lib/options.sh"
-[[ -f "$OPTIONS_SH" ]] && . "$OPTIONS_SH" && dromify_load_options
-
-# Read after the options file: the panel's saved setting is what the security
-# check must see, and an explicitly exported value already won inside
-# dromify_load_options. Defaults to off, so a missing/garbled file is the
-# strict case rather than the permissive one.
-ALLOW_INSECURE_LAN="${DROMIFY_ALLOW_INSECURE_LAN:-0}"
 
 # Every read/write/mkdir in our config + cache tree goes through this bundled
 # helper, which traverses each path component with openat(O_NOFOLLOW) so a
@@ -147,7 +115,6 @@ require_secure_url() {
   scheme=$(url_scheme "$1"); host=$(url_host "$1")
   [[ "$scheme" == https ]] && return 0
   [[ "$scheme" == http && "$LOOPBACK_HOSTS" == *" $host "* ]] && return 0
-  [[ "$scheme" == http && "$ALLOW_INSECURE_LAN" == 1 ]] && is_private_host "$host" && return 0
   return 1
 }
 
@@ -381,7 +348,7 @@ cmd_configure() {
     || fail "usage: configure <name> <serverURL> <username>   (password on stdin)"
   [[ "$server" =~ ^https?:// ]] || fail "server URL must start with http:// or https://"
   server=$(normalize_url "$server")
-  require_secure_url "$server" || fail "server URL must be https:// (plain http:// is allowed only for a server on this same machine, or on a private network with DROMIFY_ALLOW_INSECURE_LAN=1) -- see README for getting a cert on a home server"
+  require_secure_url "$server" || fail "server URL must be https:// (plain http:// is allowed only for a server on this same machine) -- see README for getting a cert on a home server"
 
   local err
   err=$(verify_credentials "$server" "$username" "$password" 2>&1) || fail "$err"
@@ -471,7 +438,7 @@ cmd_relogin() {
   server=$(jq -r '.serverURL' <<<"$profile")
   username=$(jq -r '.username' <<<"$profile")
   name=$(jq -r '.name' <<<"$profile")
-  require_secure_url "$server" || fail "profile server URL is insecure ($server); reconfigure it as https://, or set DROMIFY_ALLOW_INSECURE_LAN=1 if it is on a trusted local network -- see README"
+  require_secure_url "$server" || fail "profile server URL is insecure ($server); reconfigure it as https:// -- see README"
 
   local err
   err=$(verify_credentials "$server" "$username" "$password" 2>&1) || fail "$err"
@@ -494,7 +461,7 @@ build_url() {
   local endpoint="$1"; shift
   require_active_profile
   require_secure_url "$SERVER_URL" \
-    || fail "profile server URL is insecure ($SERVER_URL); reconfigure it as https://, or set DROMIFY_ALLOW_INSECURE_LAN=1 if it is on a trusted local network -- see README"
+    || fail "profile server URL is insecure ($SERVER_URL); reconfigure it as https:// -- see README"
   local salt token qs kv k v
   salt=$(head -c 16 /dev/urandom | md5sum | cut -c1-16)
   token=$(printf '%s' "${PASSWORD}${salt}" | md5sum | cut -d' ' -f1)

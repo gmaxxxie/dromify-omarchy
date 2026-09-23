@@ -26,19 +26,11 @@ Item {
     return u.replace(/^file:\/\//, "").replace(/\/$/, "")
   }
   readonly property string apiBin: pluginDir + "/bin/dromify-api"
-  // Where the helpers keep their state (the output choice, the renderer list,
-  // and this plugin's own options.env). Mirrors the helpers' own default.
-  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME")
-    || ((Quickshell.env("HOME") || "") + "/.local/state")) + "/dromify"
-  readonly property string optionFile: stateDir + "/options.env"
   readonly property string playerBin: pluginDir + "/bin/dromify-player"
   // Routes the transport verbs to whichever backend is selected (local mpv or
   // a UPnP renderer). Everything below still calls `playerBin`; the router
   // decides what that means, so adding a backend never touches this file.
   readonly property string outputBin: pluginDir + "/bin/dromify-output"
-  // Writes options.env with the same owner-only, no-symlink, atomic-replace
-  // care as the output choice.
-  readonly property string optionHelper: pluginDir + "/bin/dromify-options"
 
   // dromify-api already caps what it will buffer from the server, but the
   // response comes back through a StdioCollector that would hold it a second
@@ -68,40 +60,6 @@ Item {
   property var dlnaCapabilities: []
   property bool discovering: false
   property string outputError: ""
-
-  // --- plugin options -------------------------------------------------------
-  // Options the helpers read from a state file rather than argv, because the
-  // shell process cannot change its own environment. `options.env` is written
-  // with the same care as the output choice: owner-only, no symlink follow,
-  // atomic replace.
-  property bool optionsLoaded: false
-  property bool allowInsecureLan: false
-
-  // A server on this machine needs no opt-in: dromify-api already allows it,
-  // because there is no network to sniff.
-  function isLoopbackServer(url) {
-    var host = String(url || "").replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/^[^@]*@/, "")
-    host = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase()
-    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0"
-  }
-
-  // True once the user has explicitly toggled, at which point the panel stops
-  // taking the file's word for it.
-  property bool optionsDirty: false
-
-  function toggleAllowInsecureLan() {
-    var next = !allowInsecureLan
-    optionsDirty = true
-    _run(optionProcess, [optionHelper, "write", next ? "1" : "0"], function(data, err) {
-      if (err) { outputError = err; return }
-      allowInsecureLan = next
-      optionsLoaded = true
-      outputError = ""
-      // Re-run whatever the panel is showing: a refusal that was only ever
-      // about this flag should clear immediately, without a restart.
-      refreshCurrent()
-    })
-  }
 
   readonly property bool dlnaActive: output === "dlna"
   readonly property bool searchingDevices: discovering
@@ -1324,19 +1282,6 @@ Item {
     })
   }
 
-  Process {
-    id: optionProcess
-    property var _cb: null
-    running: false
-    stdout: StdioCollector { id: optionWriteOut; waitForEnd: true }
-    stderr: StdioCollector { id: optionWriteErr; waitForEnd: true }
-    onExited: function(exitCode) {
-      var cb = optionProcess._cb; optionProcess._cb = null
-      if (!cb) return
-      cb(null, exitCode === 0 ? ""
-             : String(optionWriteErr.text || "could not save the setting").replace(/^dromify-options:\s*/, "").trim())
-    }
-  }
 
   Process {
     id: outputProcess
@@ -1407,40 +1352,11 @@ Item {
     return data
   }
 
-  Component.onCompleted: {
-    refreshOptions()
-    refreshStatus(function(data) {
-      // Read the persisted output choice, then only warm mpv up when it is the
-      // backend that will actually be used.
-      refreshOutput(function() {
-        if (data && data.configured && !root.dlnaActive) _warmUpPlayer()
-      })
+  Component.onCompleted: refreshStatus(function(data) {
+    // Read the persisted output choice, then only warm mpv up when it is the
+    // backend that will actually be used.
+    refreshOutput(function() {
+      if (data && data.configured && !root.dlnaActive) _warmUpPlayer()
     })
-  }
-
-  // Reads options.env through the helper (the same validation the helpers
-  // themselves apply) rather than parsing a file from QML.
-  function refreshOptions(callback) {
-    _run(optionsReadProcess, [optionHelper, "read"], function(data, err) {
-      if (data && data.allowInsecureLan !== undefined && !optionsDirty) {
-        allowInsecureLan = data.allowInsecureLan === true
-      }
-      optionsLoaded = true
-      if (callback) callback(allowInsecureLan, err || "")
-    })
-  }
-
-  Process {
-    id: optionsReadProcess
-    property var _cb: null
-    running: false
-    stdout: StdioCollector { id: optionsReadOut; waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(exitCode) {
-      var cb = optionsReadProcess._cb; optionsReadProcess._cb = null
-      var data = null
-      try { data = JSON.parse(optionsReadOut.text) } catch (e) { /* leave null */ }
-      if (cb) cb(data, exitCode === 0 ? "" : "could not read options")
-    }
-  }
+  })
 }

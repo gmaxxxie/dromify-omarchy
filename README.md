@@ -172,25 +172,6 @@ broken:
 bin/dromify-dlna devices --scan
 ```
 
-### Plain HTTP on your own network
-
-The Subsonic auth scheme sends a replayable salt+token with every request, so
-Dromify requires `https://` — except for a server on this machine, where there
-is no network to sniff. A Navidrome on your LAN over `http://` is therefore
-refused until you say the network is trusted: **Settings → Allow plain HTTP on
-this network**. That toggle only appears when the active server is plain
-`http://` on a non-loopback address, it applies to every request (stream URLs
-included), and turning it off stops playback from that server immediately.
-
-It is stored in `~/.local/state/dromify/options.env` (owner-only) rather than
-in the shell's environment, so it needs no restart and no shell configuration.
-The environment still wins if you set it explicitly, which is what makes
-`DROMIFY_ALLOW_INSECURE_LAN=1 bin/dromify-api get …` work as a one-off.
-
-If you would rather not put the token on the wire at all, the alternatives are
-a real certificate (`tailscale serve`, or Caddy with Let's Encrypt) or an SSH
-tunnel to `http://127.0.0.1:4533`.
-
 ### Media keys
 
 Hardware media keys and `playerctl` control the **local** player, through

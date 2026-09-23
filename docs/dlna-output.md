@@ -71,11 +71,15 @@ reachable *from the renderer*:
   an error, and the daemon binds one LAN address rather than `0.0.0.0`. It is
   used **only** when a direct fetch cannot work (https + a renderer that
   refuses TLS), never as a default path, and it idles out on its own.
-- `DROMIFY_ALLOW_INSECURE_LAN=1` is the other answer to the same problem:
-  plain `http://` to a private address, when the user says the network is
-  trusted. It is opt-in per shell and never a config default, because the
-  Subsonic salt+token is replayable. The two options are complementary — the
-  bridge keeps TLS on the wire, the flag drops it deliberately.
+- **A loopback tunnel is the other answer, and the one to prefer when the
+  server is on the LAN.** `systemd --user` unit `dromify-tunnel.service` holds
+  `ssh -L 127.0.0.1:4533:<server>:4533` open, which makes the server a loopback
+  address: upstream's rule is satisfied without weakening it, and the token
+  never crosses the wire in the clear because SSH is carrying it.
+  **But a tunnel and DLNA are mutually exclusive in one direction:** a
+  renderer fetches the stream itself, and `127.0.0.1` on a renderer means the
+  renderer. So use the loopback tunnel for local (mpv) playback, and the LAN
+  address — through `bin/dromify-bridge` if the server is https — for casting.
 
 ## Discovery, and why it is not one M-SEARCH
 

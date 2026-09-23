@@ -34,35 +34,30 @@ DLNA="$HERE/dromify-dlna"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dromify"
 OUTPUT_FILE="$STATE_DIR/output"
 
-# Panel-set options (see bin/dromify-options). Loaded rather than parsed so the
-# flag reaches this script *and* every helper it goes on to spawn, which is the
-# whole point — the panel cannot set its own process environment.
-OPTIONS_SH="$HERE/../lib/options.sh"
-# shellcheck disable=SC1090
-[[ -f "$OPTIONS_SH" ]] && . "$OPTIONS_SH" && dromify_load_options
-
 fail() { echo "dromify-output: $*" >&2; exit 1; }
 
-# Reads the queue JSON from stdin and prints mpv's url/title line pairs.
-# Field count is taken from the payload, not from argv: the panel passes a
-# count too, but trusting one source avoids a mismatch silently queueing the
-# wrong number of tracks. The authenticated stream URLs are read here and
-# written straight on to the child's stdin — never to a file, never to argv.
+# Reads the queue JSON from stdin (exactly one line — see the note in
+# dromify-dlna's read_queue_payload for why EOF is not usable here) and prints
+# mpv's url/title line pairs.
+#
+# The child is pointed at a *fresh* descriptor carrying those pairs rather than
+# at this script's stdin. Two reasons: the payload has already been consumed
+# here, so there is nothing left on stdin for it; and a helper that inherited
+# this stdin would block on a pipe the panel never closes.
 queue_json_to_pairs() {
   command -v jq >/dev/null 2>&1 || fail "'jq' is required but not found on PATH"
   local payload
-  payload="$(cat)" || fail "could not read the queue payload"
+  IFS= read -r payload || fail "no queue payload on stdin"
   [[ -n "$payload" ]] || fail "empty queue payload"
-  printf '%s' "$payload" | jq -r '
+  printf '%s' "$payload" | jq -jr '
     if (.tracks | type) != "array" then error("queue payload has no tracks array")
-    else .tracks[] | [(.url // ""), ((.title // "") | gsub("[\r\n]+"; " "))] | @tsv end
-  ' | while IFS=$'\t' read -r url title; do
-        printf '%s\n%s\n' "$url" "$title"
-      done
+    else
+      .tracks[]
+      | ((.url // "") | gsub("[\r\n]"; " ")), "\n",
+        ((.title // "") | gsub("[\r\n]"; " ")), "\n"
+    end
+  '
 }
-
-[[ -x "$PLAYER" ]] || fail "missing helper: $PLAYER"
-[[ -f "$DLNA" ]] || fail "missing helper: $DLNA"
 
 current_output() {
   local value=""
@@ -128,9 +123,13 @@ case "${1:-}" in
         # next local track start instantly. The output only switches after
         # the renderer is confirmed, so a bad selector leaves it where it was.
         "$PLAYER" stop >/dev/null 2>&1 || true
-        python3 "$DLNA" select "$selector" || exit $?
+        # One JSON line out, not two. The QML side reads `renderer` to learn
+        # which device it just selected, and a second acknowledgement line
+        # would parse as the "latest" object and hide it — which is exactly
+        # what made the output switch look like it did nothing.
+        selection="$(python3 "$DLNA" select "$selector")" || exit $?
         set_output dlna
-        printf '{"ok":true,"output":"dlna"}\n'
+        printf '%s\n' "$selection" | jq -c '. + {output: "dlna"}'
         ;;
       *)
         fail "unknown output '${1}' (expected: local | dlna <renderer>)"
@@ -145,8 +144,8 @@ case "${1:-}" in
     fi
     # The count argument is preserved: dromify-player validates it against the
     # payload it is about to read, which is exactly the check worth keeping.
-    # Process substitution, not a pipe, so the child gets the payload as its
-    # stdin and `exec` keeps the exit status it reports.
+    # Process substitution, not a pipe, so the child gets the records on fd 0
+    # and `exec` keeps the exit status it reports.
     exec "$PLAYER" "$verb" "$@" < <(queue_json_to_pairs)
     ;;
   devices)

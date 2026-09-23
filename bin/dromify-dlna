@@ -568,11 +568,34 @@ def cmd_configure(args) -> None:
     out({"ok": True, "bridge": state.get("bridge", "auto")})
 
 
-def cmd_load_queue(args) -> None:
+def read_queue_payload() -> dict:
+    """Read the queue JSON from stdin.
+
+    Exactly one line, never to EOF. The panel writes
+    `JSON.stringify(payload) + "\n"` and — this is the part that matters —
+    Quickshell's Process does **not** close the child's stdin afterwards. A
+    `json.load(sys.stdin)` therefore blocks forever: the process finishes its
+    work, writes its answer, and never exits, so the UI sits in `loading` and
+    the track never appears to play. dromify-player never hit this because it
+    reads a fixed number of lines and so never needed EOF.
+
+    Reading one line also means a caller that *does* close stdin (a shell
+    pipe, a test) behaves identically.
+    """
+    line = sys.stdin.readline()
+    if not line.strip():
+        fail("no queue payload on stdin")
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(line)
     except ValueError as exc:
         fail("queue payload is not JSON: %s" % exc)
+    if not isinstance(payload, dict):
+        fail("queue payload is not a JSON object")
+    return payload
+
+
+def cmd_load_queue(args) -> None:
+    payload = read_queue_payload()
     tracks = payload.get("tracks") or []
     if not tracks:
         fail("queue payload has no tracks")
@@ -600,10 +623,7 @@ def cmd_reorder_tail(args) -> None:
     restart the stream from zero. Its URIs stay valid because the head of the
     queue is untouched.
     """
-    try:
-        payload = json.load(sys.stdin)
-    except ValueError as exc:
-        fail("queue payload is not JSON: %s" % exc)
+    payload = read_queue_payload()
     tracks = payload.get("tracks") or []
     state = load_state()
     index = int(payload.get("start") or state.get("index") or 0)
