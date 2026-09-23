@@ -1165,6 +1165,9 @@ Panel {
         label: "This Computer"
         subtitle: "Play through mpv on this machine"
         selected: !nav.dlnaActive
+        // Layout.fillWidth, not width: parent.width — inside a ColumnLayout the
+        // layout owns the width, and a bare width binding gets overridden by it.
+        Layout.fillWidth: true
         onActivated: nav.selectLocalOutput(function() {})
       }
 
@@ -1175,6 +1178,7 @@ Panel {
           label: modelData.name
           subtitle: [modelData.manufacturer, modelData.model].filter(function(s) { return s && s !== "" }).join(" · ")
           selected: outputSection.isRendererSelected(modelData)
+          Layout.fillWidth: true
           onActivated: nav.selectDlnaOutput(modelData.udn, function(ok, err) {
             if (!ok) nav.outputError = err
           })
@@ -1248,6 +1252,15 @@ Panel {
     property string label: ""
     property string subtitle: ""
     property bool selected: false
+    // Explicit sizing. CursorSurface is a BorderSurface (a Rectangle), and a
+    // Rectangle's implicitWidth does not come from its children — so inside a
+    // ColumnLayout this row measured 0 wide. It still painted (children are
+    // laid out from the anchors below) but its MouseArea had zero area, which
+    // is why clicking a renderer did nothing at all. ItemRow and TabButton
+    // each solve this their own way; this one fills the width it is given and
+    // takes its height from the content.
+    implicitWidth: rowLayout.implicitWidth
+    implicitHeight: rowLayout.implicitHeight + Style.space(8)
     // Declared explicitly (as the panel's other Repeater delegates do) so the
     // delegate can be constructed from both a Repeater model and a plain
     // inline instance; without it the Repeater's `required property var
@@ -1256,7 +1269,6 @@ Panel {
     signal activated()
 
     foreground: root.foreground
-    implicitHeight: rowLayout.implicitHeight + Style.space(8)
     color: outputRow.selected ? fill : (outputRowArea.containsMouse ? fill : "transparent")
     borderSpec: outputRow.selected ? Border.controlSpec("focus", root.foreground, Color.accent)
                                    : Border.none()
