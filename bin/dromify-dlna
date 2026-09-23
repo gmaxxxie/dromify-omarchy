@@ -360,7 +360,7 @@ def _expected_mime(state: dict, index: int) -> str:
 
 
 def start_track(state: dict, index: int, preload: bool = True,
-                retry: bool = True) -> dict:
+                retry: bool = True, repeat_mode: str = "") -> dict:
     """Set + play queue[index], optionally preloading index+1.
 
     One immediate retry on failure: the ZR7's UPnP stack intermittently
@@ -395,13 +395,23 @@ def start_track(state: dict, index: int, preload: bool = True,
 
     # Preload the next track when the device offers SetNextAVTransportURI —
     # gapless-ish hand-off, and it's how the ZR7's own Next button works.
+    # Repeat-all preloads the first track when this is the last one, so the
+    # wrap is the renderer's doing rather than a poll-interval gap.
+    repeat_mode = repeat_mode or state.get("repeat", "off")
     preloaded = False
-    if preload and index + 1 < len(tracks):
-        next_uri = _expected_uri(state, index + 1)
-        next_meta = dlna.didl_lite(next_uri, tracks[index + 1],
-                                   mime=_expected_mime(state, index + 1))
+    next_index = index + 1
+    if preload and next_index >= len(tracks) and repeat_mode == "all":
+        next_index = 0
+    if preload and 0 <= next_index < len(tracks) and next_index != index:
+        next_uri = _expected_uri(state, next_index)
+        next_meta = dlna.didl_lite(next_uri, tracks[next_index],
+                                   mime=_expected_mime(state, next_index))
         ok_next, _ = renderer.set_next_uri(next_uri, next_meta)
         preloaded = ok_next
+    elif preload:
+        # Clear a stale preload: otherwise the renderer would go on to a track
+        # the queue no longer contains (after a stop, or at the queue's end).
+        renderer.set_next_uri("", "")
 
     ok, fields = renderer.play()
     if not ok:
@@ -412,6 +422,11 @@ def start_track(state: dict, index: int, preload: bool = True,
 
     state["index"] = index
     state["preloaded"] = preloaded
+    # A renderer that was at the end of the *previous* track is still
+    # "PAUSED_PLAYBACK at duration" until it starts decoding; clearing this
+    # stops the status handler from immediately re-firing the end-of-track
+    # logic against the track we just started.
+    state["ended"] = False
     state["lastError"] = ""
     state["updated"] = time.time()
     save_state(state)
@@ -443,18 +458,6 @@ def detect_advance(state: dict, transport: dict, position: dict) -> dict | None:
     # source, or a URL from a previous Dromify session). Don't fake an index.
     dlna.log("renderer TrackURI not in queue: %s" % dlna.redact(current))
     return None
-
-
-def advance_after_end(state: dict, position: dict) -> dict:
-    """The preloaded next track ended the queue, or nothing was preloaded."""
-    index = state.get("index", -1)
-    tracks = state.get("tracks", [])
-    if index + 1 < len(tracks):
-        return start_track(state, index + 1)
-    state["ended"] = True
-    state["lastError"] = ""
-    save_state(state)
-    return {"ok": True, "ended": True}
 
 
 def cmd_devices(args) -> None:
@@ -793,32 +796,39 @@ def cmd_status(args) -> None:
         save_state(state)
         dlna.log("renderer moved to queue index %d (%s)" % (index, moved["reason"]))
 
-    # A STOPPED renderer at (or past) the end of a track means it finished and
-    # there was no preloaded next item — advance the queue ourselves. A STOPPED
-    # renderer near position 0 means a real stop, which must not auto-advance.
+    # End of a track, when the renderer did not advance itself. Two shapes,
+    # both measured on an SRS-ZR7: with no next item queued it settles into
+    # PAUSED_PLAYBACK sitting at the end of the stream, and after a Stop it
+    # reports STOPPED. Either way the position is at (or past) the duration,
+    # which is what distinguishes "the track ended" from "someone paused it" —
+    # a real pause is somewhere in the middle.
     elapsed = dlna.parse_hms(position.get("RelTime", ""))
     duration = dlna.sane_duration(position.get("TrackDuration", ""),
                                   (track or {}).get("duration"))
-    if tstate == "STOPPED" and not state.get("ended") and track:
-        finished = duration > 0 and elapsed >= max(0.0, duration - END_TOLERANCE)
-        if finished:
-            dlna.log("track finished (%.1fs of %.1fs); advancing" % (elapsed, duration))
-            repeat = state.get("repeat", "off")
-            if track.get("id"):
-                state["finishedId"] = track["id"]
-                state["scrobbled"] = ""
-            if repeat == "one":
-                start_track(state, index, preload=False)
-            elif index + 1 < len(tracks):
-                start_track(state, index + 1)
-            elif repeat == "all":
-                start_track(state, 0)
-            else:
-                state["ended"] = True
-                save_state(state)
-            transport = renderer.transport_info()
-            position = renderer.position_info()
-            tstate = transport.get("CurrentTransportState", tstate)
+    at_end = duration > 0 and elapsed >= max(0.0, duration - END_TOLERANCE)
+    if tstate in ("STOPPED", "PAUSED_PLAYBACK") and at_end \
+            and not state.get("ended") and track:
+        dlna.log("track finished (%s %.1fs of %.1fs); advancing"
+                 % (tstate, elapsed, duration))
+        # Report the finished track so the panel can scrobble it. This cannot
+        # be done here: these scripts hold no credentials and never talk to
+        # the server, same split as dromify-player.
+        if track.get("id"):
+            state["finishedId"] = track["id"]
+            state["scrobbled"] = ""
+        repeat = state.get("repeat", "off")
+        if repeat == "one":
+            start_track(state, index, preload=False, repeat_mode=repeat)
+        elif index + 1 < len(tracks):
+            start_track(state, index + 1, repeat_mode=repeat)
+        elif repeat == "all":
+            start_track(state, 0, repeat_mode=repeat)
+        else:
+            state["ended"] = True
+            save_state(state)
+        transport = renderer.transport_info()
+        position = renderer.position_info()
+        tstate = transport.get("CurrentTransportState", tstate)
 
     paused = tstate == "PAUSED_PLAYBACK"
     playing = tstate == "PLAYING"
