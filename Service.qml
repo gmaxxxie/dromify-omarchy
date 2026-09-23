@@ -656,6 +656,7 @@ Item {
   // play queue (an album, a playlist, search results, ...).
   function playFrom(songs, startIndex) {
     if (!songs || startIndex < 0 || startIndex >= songs.length) return
+    logEvent("playFrom", songs.length + " tracks from " + startIndex + ", output " + output)
     // A shuffled order only means something relative to the queue it came
     // from; starting a new one (a different album, a fresh search, ...)
     // makes that stale, so drop it rather than carry a shuffle flag that
@@ -700,6 +701,7 @@ Item {
   }
 
   function togglePause() {
+    logEvent("togglePause", "queueIndex " + queueIndex)
     if (queueIndex < 0) return
     // A renderer that reports no Pause action (the SRS-ZR7 while playing) is
     // not asked: the panel disables the button, and this guard is what keeps a
@@ -1224,6 +1226,7 @@ Item {
   // immediately and the sweep runs behind it, updating the list when it lands.
   // Nothing in the UI waits on the network.
   function refreshDevices(callback) {
+    logEvent("refreshDevices")
     outputError = ""
     _run(cachedDeviceProcess, [outputBin, "devices", "--json", "--cached"],
          function(data, err) {
@@ -1274,7 +1277,8 @@ Item {
   }
 
   function selectLocalOutput(callback) {
-    _run(outputProcess, [outputBin, "output", "local"], function(data, err) {
+    var queued = _run(outputProcess, [outputBin, "output", "local"], function(data, err) {
+      logEvent("selectLocalOutput done", err || (data ? String(data.output) : "no data"))
       output = "local"
       dlnaCapabilities = []
       dlnaState = ""
@@ -1289,11 +1293,13 @@ Item {
       _warmUpPlayer()
       if (callback) callback(!err, err || "")
     })
+    logEvent("selectLocalOutput", queued ? "" : "(DROPPED: output process busy)")
   }
 
   function selectDlnaOutput(selector, callback) {
     selectedDevice = String(selector)
-    _run(outputProcess, [outputBin, "output", "dlna", String(selector)], function(data, err) {
+    var queued = _run(outputProcess, [outputBin, "output", "dlna", String(selector)], function(data, err) {
+      logEvent("selectDlnaOutput done", (err || (data && data.renderer ? data.renderer.name : "no data")))
       if (err || !data || !data.renderer) {
         outputError = err || "could not select that renderer"
         if (callback) callback(false, outputError)
@@ -1310,6 +1316,7 @@ Item {
       pollTimer.restart()
       if (callback) callback(true, "")
     })
+    logEvent("selectDlnaOutput", selector + (queued ? "" : " (DROPPED: output process busy)"))
   }
 
 
@@ -1392,6 +1399,87 @@ Item {
       try { var parsed = JSON.parse(line); if (parsed && parsed.devices) data = parsed } catch (e) { /* skip */ }
     }
     return data
+  }
+
+  // --- action log -------------------------------------------------------------
+  // A small ring buffer of what the panel was asked to do and what happened.
+  // Read over IPC (`dromifyService events`). It exists because a click that
+  // silently does nothing is otherwise indistinguishable from a click that
+  // never arrived, and that difference is the whole diagnosis.
+  property var _events: []
+
+  function logEvent(what, detail) {
+    var entry = { at: Date.now(), what: what, detail: detail || "" }
+    var next = _events.concat([entry])
+    if (next.length > 40) next = next.slice(next.length - 40)
+    _events = next
+    console.log("dromify: " + what + (detail ? " — " + detail : ""))
+  }
+
+  function events() {
+    return JSON.stringify(_events)
+  }
+
+  // --- diagnostic IPC ---------------------------------------------------------
+  // `qs ipc --pid <shell pid> call dromifyService state` prints what the panel
+  // believes: the output choice, the renderer, the queue, the last error. It
+  // exists because the panel is a popup — with no synthetic pointer on this
+  // machine, inspecting that state from outside is otherwise impossible, and
+  // several real bugs were invisible from the command line while being obvious
+  // in here.
+  IpcHandler {
+    target: "dromifyService"
+
+    function events(): string { return root.events() }
+
+    function state(): string {
+      return JSON.stringify({
+        configured: root.configured,
+        output: root.output,
+        dlnaActive: root.dlnaActive,
+        renderer: root.dlnaRenderer,
+        dlnaState: root.dlnaState,
+        capabilities: root.dlnaCapabilities,
+        devices: root.dlnaDevices.map(function(d) { return d.name }),
+        discovering: root.discovering,
+        queueIndex: root.queueIndex,
+        queueLength: root.queue.length,
+        loading: root.loading,
+        playing: root.playing,
+        paused: root.paused,
+        position: root.position,
+        duration: root.duration,
+        codec: root.audioCodec,
+        lastError: root.lastError,
+        outputError: root.outputError,
+        pollInterval: pollTimer.interval,
+        pollRunning: pollTimer.running
+      })
+    }
+
+    function devices(): string {
+      root.refreshDevices(function(list) {})
+      return "sweeping"
+    }
+
+    function select(udn: string): string {
+      root.selectDlnaOutput(udn, function(ok, err) {})
+      return "selecting " + udn
+    }
+
+    function useLocal(): string {
+      root.selectLocalOutput(function() {})
+      return "switching"
+    }
+
+    // Play the first track of an album/playlist id — the same path a click on
+    // a song row takes.
+    function playAlbum(albumId: string): string {
+      root.fetchAlbumSongs(albumId, function(songs) {
+        if (songs.length) root.playFrom(songs, 0)
+      })
+      return "playing " + albumId
+    }
   }
 
   Component.onCompleted: refreshStatus(function(data) {
