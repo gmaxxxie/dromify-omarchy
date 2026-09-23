@@ -47,8 +47,12 @@ fail() { echo "dromify-output: $*" >&2; exit 1; }
 queue_json_to_pairs() {
   command -v jq >/dev/null 2>&1 || fail "'jq' is required but not found on PATH"
   local payload
-  IFS= read -r payload || fail "no queue payload on stdin"
-  [[ -n "$payload" ]] || fail "empty queue payload"
+  # `|| true` on purpose: `read` returns non-zero at EOF *and* hands back what
+  # it read, so a payload with no trailing newline is still usable. Requiring
+  # the newline would make this fail on a caller that writes the JSON and
+  # closes — a shell `printf '%s' "$json" |`, for instance.
+  IFS= read -r payload || true
+  [[ -n "$payload" ]] || fail "no queue payload on stdin"
   printf '%s' "$payload" | jq -jr '
     if (.tracks | type) != "array" then error("queue payload has no tracks array")
     else
@@ -144,9 +148,23 @@ case "${1:-}" in
     fi
     # The count argument is preserved: dromify-player validates it against the
     # payload it is about to read, which is exactly the check worth keeping.
-    # Process substitution, not a pipe, so the child gets the records on fd 0
-    # and `exec` keeps the exit status it reports.
-    exec "$PLAYER" "$verb" "$@" < <(queue_json_to_pairs)
+    #
+    # The records go to a temp file rather than through a pipe or process
+    # substitution. Both of those work in an interactive shell but not
+    # reliably here: under `subprocess.run(stdin=PIPE)` the shell's fd 0 is a
+    # closed pipe, and bash can reorder the redirections in a way that leaves
+    # the helper with the wrong stdin. A file has no such ambiguity, and it is
+    # 0600 in a 0700 directory and unlinked immediately.
+    records="$(mktemp -p "${XDG_RUNTIME_DIR:-/tmp}" dromify-queue.XXXXXX)" \
+      || fail "cannot create a queue file"
+    chmod 600 "$records" 2>/dev/null || true
+    trap 'rm -f -- "$records"' EXIT
+    queue_json_to_pairs >"$records" || exit $?
+    "$PLAYER" "$verb" "$@" <"$records"
+    status=$?
+    rm -f -- "$records"
+    trap - EXIT
+    exit "$status"
     ;;
   devices)
     shift

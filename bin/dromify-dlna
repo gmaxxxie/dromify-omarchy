@@ -42,6 +42,7 @@ and a renderer that can't do Pause reports that instead of pretending.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -64,6 +65,15 @@ BRIDGE_BIN = os.path.join(HERE, "dromify-bridge")
 # long a device stays in the list after it was last seen.
 CACHE_TTL = 300
 DEVICE_TTL = 7 * 24 * 3600
+
+# How long a sweep is allowed to take, and how many M-SEARCH rounds it may run.
+# These are deliberately small: discovery runs while the user is looking at the
+# panel, and a renderer found a second later is worth much less than a UI that
+# answers. 2 rounds keeps the "some devices only answer intermittently" fix
+# (measured: an SRS-ZR7 replies to roughly one probe in six) without paying for
+# the third round that never changed the result.
+DEFAULT_TIMEOUT = 3.0
+DEFAULT_ROUNDS = 2
 
 # Where the renderer's position must be within a track before we treat a
 # STOPPED state as "the track ended" rather than "someone hit stop".
@@ -242,7 +252,42 @@ def subnet_hosts(prefix: str = "") -> list[str]:
     return unique
 
 
-def discover(timeout: float = 6.0, refresh: bool = False) -> list[dict]:
+def verify_device(device: dict, timeout: float = 3.0) -> bool:
+    """Whether a known renderer still answers on its own control endpoint.
+
+    One SOAP call, milliseconds. This is what makes the cached list
+    trustworthy: SSDP is the unreliable part (measured: an SRS-ZR7 answers
+    roughly one M-SEARCH in four, and often only at the very end of the
+    window), while the device's AVTransport endpoint answers immediately. So
+    "is this renderer still there?" is answered by asking it, not by hoping it
+    announces itself.
+    """
+    if not device.get("avTransportControlURL"):
+        return False
+    ok, _ = dlna.soap_call(device["avTransportControlURL"], dlna.AVTRANSPORT,
+                           "GetTransportInfo", {"InstanceID": 0}, timeout=timeout)
+    return ok
+
+
+def verify_devices(devices: list[dict], timeout: float = 3.0) -> list[dict]:
+    """Probe every cached device concurrently; keep the ones that answered."""
+    if not devices:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(devices))) as pool:
+        alive = list(pool.map(lambda d: verify_device(d, timeout), devices))
+    kept = [device for device, ok in zip(devices, alive) if ok]
+    for device, ok in zip(devices, alive):
+        if not ok:
+            dlna.log("dropping %s: control endpoint did not answer"
+                     % device.get("name", "?"))
+    return kept
+
+
+def discover(timeout: float = DEFAULT_TIMEOUT, refresh: bool = False,
+             rounds: int = DEFAULT_ROUNDS,
+             budget: float = 0.0,
+             verify: bool = True) -> list[dict]:
     """The renderer list, merged with what previous sweeps have seen.
 
     A sweep is *additive*, never a replacement. SSDP is lossy in practice —
@@ -255,34 +300,60 @@ def discover(timeout: float = 6.0, refresh: bool = False) -> list[dict]:
     cache = load_cache()
     fresh = cache.get("devices", [])
     if refresh or not fresh or time.time() - cache.get("at", 0) >= CACHE_TTL:
-        found = dlna.discover(timeout=timeout, known_hosts=known_hosts())
+        started = time.time()
+        found = dlna.discover(timeout=timeout, known_hosts=known_hosts(),
+                              rounds=rounds,
+                              budget=budget or max(4.0, timeout * 2.0))
+        dlna.log("sweep took %.1fs and found %d device(s)"
+                 % (time.time() - started, len(found)))
         fresh = merge_devices(fresh, found)
         save_cache(fresh)
-        if not found:
-            dlna.log("discovery sweep found nothing; keeping %d cached device(s)"
-                     % len(fresh))
+
+    # Confirm the cached entries are still alive before handing them out. This
+    # is what makes a cached list as trustworthy as a fresh sweep, without a
+    # sweep: SSDP may have missed a device this round, but a device that still
+    # answers must not disappear from the picker because of it.
+    if verify and fresh:
+        verified = verify_devices(fresh)
+        if len(verified) != len(fresh):
+            save_cache(verified)
+        fresh = verified
     return [device for device in fresh
             if time.time() - device.get("seen", 0) < DEVICE_TTL]
 
 
-def resolve_device(selector: str, timeout: float = 6.0) -> dict | None:
-    devices = discover(timeout=timeout)
-    if selector.isdigit():
-        index = int(selector)
-        if 0 <= index < len(devices):
-            return devices[index]
+def resolve_device(selector: str, timeout: float = DEFAULT_TIMEOUT,
+                   refresh: bool = True) -> dict | None:
+    """Find the renderer a selector names.
+
+    The cache is consulted first: the UDN comes from the picker, which was
+    populated from the cache, so the common case is a cache hit and needs no
+    network at all. Only a miss pays for a sweep — and the picker's own
+    background sweep has usually just refreshed it anyway.
+    """
+    def match(devices: list[dict]) -> dict | None:
+        if selector.isdigit():
+            index = int(selector)
+            return devices[index] if 0 <= index < len(devices) else None
+        wanted = selector.strip().lower()
+        for device in devices:
+            if device.get("udn", "").lower() == wanted:
+                return device
+        for device in devices:
+            if device.get("name", "").lower() == wanted:
+                return device
+        for device in devices:
+            if wanted and wanted in device.get("name", "").lower():
+                return device
         return None
-    wanted = selector.strip().lower()
-    for device in devices:
-        if device.get("udn", "").lower() == wanted:
-            return device
-    for device in devices:
-        if device.get("name", "").lower() == wanted:
-            return device
-    for device in devices:
-        if wanted and wanted in device.get("name", "").lower():
-            return device
-    return None
+
+    hit = match(discover(timeout=timeout, refresh=False))
+    if hit:
+        return hit
+    if not refresh:
+        return None
+    dlna.log("selector %r not in the device cache; sweeping" % selector)
+    return match(discover(timeout=timeout, refresh=True))
 
 
 def renderer_for(state: dict) -> dlna.Renderer | None:
@@ -305,6 +376,16 @@ def bridge_base(state: dict) -> str:
         dlna.log("bridge ensure failed: %s" % exc)
         return ""
     return payload.get("base", "")
+
+
+def is_loopback_url(url: str) -> bool:
+    """Whether a URL points at this machine's own loopback interface."""
+    host = url.split("//", 1)[-1].split("/", 1)[0].split("@")[-1]
+    if host.startswith("["):
+        host = host.split("]")[0].lstrip("[")
+    else:
+        host = host.split(":")[0]
+    return host.lower() in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 
 def renderer_urls(state: dict, tracks: list[dict]) -> list[tuple[str, str]]:
@@ -350,13 +431,26 @@ def renderer_urls(state: dict, tracks: list[dict]) -> list[tuple[str, str]]:
             dlna.log("bridge disabled; sending https URL to renderer as-is")
         return prepared
 
-    if not any(url.startswith("https://") for url, _ in prepared):
+    # The renderer fetches the stream itself, so the URL has to be reachable
+    # *from the renderer*. Two cases need the local relay, and they are the
+    # same problem (the renderer cannot reach this URL) with two causes:
+    #   - https://  — the renderer may speak no TLS at all
+    #   - a loopback host — 127.0.0.1 on the renderer is the renderer, so a
+    #     server reached through a local tunnel (see dromify-tunnel.service)
+    #     is invisible to it
+    # bin/dromify-bridge resolves both: it is this machine, reachable on the
+    # LAN, and it fetches the real URL over whatever transport that needs.
+    needs_relay = [url for url, _ in prepared
+                   if url.startswith("https://") or is_loopback_url(url)]
+    if not needs_relay:
         return prepared
+    dlna.log("%d of %d stream URL(s) are not renderer-reachable; relaying"
+             % (len(needs_relay), len(prepared)))
 
     base = bridge_base(state)
     if not base:
-        fail("could not start the stream bridge (needed for an https server); "
-             "run: dromify-bridge ensure")
+        fail("could not start the stream bridge (needed because the server URL "
+             "is not reachable from the renderer); run: dromify-bridge ensure")
     urls = [url for url, _ in prepared]
     try:
         result = subprocess.run([sys.executable, BRIDGE_BIN, "urls"],
@@ -511,7 +605,8 @@ def detect_advance(state: dict, transport: dict, position: dict) -> dict | None:
 
 
 def cmd_devices(args) -> None:
-    devices = discover(timeout=args.timeout, refresh=not args.cached)
+    devices = discover(timeout=args.timeout, refresh=not args.cached,
+                       rounds=args.rounds)
     if args.scan:
         # Fallback for a renderer whose SSDP responder is broken or filtered:
         # an explicit sweep of the local /24s. User-initiated only — it is a
@@ -572,15 +667,18 @@ def read_queue_payload() -> dict:
     """Read the queue JSON from stdin.
 
     Exactly one line, never to EOF. The panel writes
-    `JSON.stringify(payload) + "\n"` and — this is the part that matters —
-    Quickshell's Process does **not** close the child's stdin afterwards. A
-    `json.load(sys.stdin)` therefore blocks forever: the process finishes its
-    work, writes its answer, and never exits, so the UI sits in `loading` and
-    the track never appears to play. dromify-player never hit this because it
-    reads a fixed number of lines and so never needed EOF.
+    `JSON.stringify(payload) + "\n"`, which is the whole document, and this
+    reads exactly that.
 
-    Reading one line also means a caller that *does* close stdin (a shell
-    pipe, a test) behaves identically.
+    Deliberately *not* `json.load(sys.stdin)`: Quickshell's Process never
+    closes a child's stdin on its own, so anything that reads to EOF blocks
+    forever. The process would consume the payload, do its work, and then
+    hang — never exiting, so the panel never sees the answer and the track
+    never appears to start. (Service.qml now also sets `stdinEnabled = false`
+    once the payload is written to give the child its EOF; this remains as the
+    belt to that braces, because a helper must not be able to hang on a
+    caller's oversight. dromify-player never hit any of this — it reads a
+    fixed number of lines and so never needed an EOF at all.)
     """
     line = sys.stdin.readline()
     if not line.strip():
@@ -946,9 +1044,11 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd")
 
     p = sub.add_parser("devices")
-    p.add_argument("--timeout", type=float, default=6.0)
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument("--json", action="store_true")
     p.add_argument("--cached", action="store_true", help="cache only, no sweep")
+    p.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS,
+                   help="M-SEARCH rounds (more finds flaky responders, slower)")
     p.add_argument("--scan", action="store_true",
                    help="also sweep the local /24s for a renderer that does "
                         "not answer SSDP")

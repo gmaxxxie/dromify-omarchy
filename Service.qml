@@ -1072,6 +1072,10 @@ Item {
         configureProcess.write(configureProcess._secret + "\n")
         configureProcess._secret = ""
       }
+      // Same reason as playQueueProcess above: dromify-api reads the password
+      // as one line so it does not need EOF, but a helper must never be left
+      // holding a pipe that is closed only when this object is destroyed.
+      configureProcess.stdinEnabled = false
     }
     onExited: function(exitCode) {
       configureProcess._secret = ""
@@ -1149,6 +1153,14 @@ Item {
         playQueueProcess.write(playQueueProcess._secret + "\n")
         playQueueProcess._secret = ""
       }
+      // Close stdin now that the payload is in. Quickshell does NOT close it
+      // on its own, and the backend reads the queue from stdin — so without
+      // this the helper consumes the payload, does its work, and then blocks
+      // forever waiting for an EOF that never comes. The process never exits,
+      // the panel never sees its answer, and the track never starts. (The
+      // local backend reads a fixed number of lines so it never needed the
+      // EOF; the DLNA backend's JSON read does.)
+      playQueueProcess.stdinEnabled = false
     }
     onExited: function(exitCode) {
       playQueueProcess._secret = ""
@@ -1206,13 +1218,31 @@ Item {
     })
   }
 
+  // Two-phase on purpose: the cached list is instant, a sweep is not (6-8s on
+  // a real network — SSDP probes are short but there are two interfaces and the
+  // renderers answer intermittently). So the picker is populated from the cache
+  // immediately and the sweep runs behind it, updating the list when it lands.
+  // Nothing in the UI waits on the network.
   function refreshDevices(callback) {
-    discovering = true
     outputError = ""
+    _run(cachedDeviceProcess, [outputBin, "devices", "--json", "--cached"],
+         function(data, err) {
+      var devices = (data && data.devices) ? data.devices : []
+      if (devices.length) dlnaDevices = devices
+      if (callback) callback(dlnaDevices, "")
+      // Now the sweep, in the background. Its own `running` guard means a
+      // second click cannot stack two sweeps.
+      sweepDevices()
+    })
+  }
+
+  function sweepDevices(callback) {
+    if (deviceProcess.running) return
+    discovering = true
     _run(deviceProcess, [outputBin, "devices", "--json"], function(data, err) {
       discovering = false
       var devices = (data && data.devices) ? data.devices : []
-      dlnaDevices = devices
+      if (devices.length) dlnaDevices = devices
       if (devices.length === 0 && err) outputError = err
       if (callback) callback(devices, err || "")
     })
@@ -1306,6 +1336,18 @@ Item {
         return
       }
       if (cb) cb(data, "")
+    }
+  }
+
+  Process {
+    id: cachedDeviceProcess
+    property var _cb: null
+    running: false
+    stdout: StdioCollector { id: cachedDeviceOut; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      var cb = cachedDeviceProcess._cb; cachedDeviceProcess._cb = null
+      if (cb) cb(exitCode === 0 ? root.parseDeviceList(cachedDeviceOut.text) : null, "")
     }
   }
 

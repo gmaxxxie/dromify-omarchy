@@ -26,6 +26,7 @@ from __future__ import annotations
 import concurrent.futures
 import html
 import re
+import select
 import socket
 import struct
 import threading
@@ -165,14 +166,21 @@ def ssdp_search(
     interface_ips: list[str] | None = None,
     rounds: int = 1,
 ) -> list[dict[str, str]]:
-    """One M-SEARCH round; returns raw header dicts (with `_source`).
+    """M-SEARCH every interface at once; returns raw header dicts.
 
-    `rounds` repeats the probe on a fresh socket. Some renderers answer an
-    M-SEARCH only intermittently — measured on a Sony SRS-ZR7, roughly one in
-    six probes gets a reply, while its HTTP side is perfectly reliable — so a
-    single round is not a discovery strategy, it's a coin flip. Callers that
-    want reliability pass several rounds; the device list is cached afterwards
-    so this only matters for the first sweep.
+    All the sockets send together and are then drained together with one
+    `select`, so the cost is a single collection window rather than
+    interfaces x rounds x window. That matters: measured on this network, a
+    Sony SRS-ZR7's reply can arrive several seconds after the probe while the
+    other renderer answers immediately, so a per-socket sequential drain either
+    waits out the slow one for every socket or cuts it off.
+
+    `rounds` still repeats the probe (a device that drops one M-SEARCH gets
+    another), but the repeats are pipelined into the same window — send round
+    2's probe while still listening for round 1's answer. That is what makes
+    "repeat the probe" affordable: the original implementation paid
+    `timeout` seconds per round per interface, which is where discovery's
+    ~45s came from.
     """
     if timeout is None:
         timeout = mx + 2
@@ -188,45 +196,60 @@ def ssdp_search(
         "\r\n" % (SSDP_ADDR, SSDP_PORT, mx, search_target)
     ).encode()
 
+    sockets: dict[int, socket.socket] = {}
     results: list[dict[str, str]] = []
-    for iface_ip in interface_ips:
-        for round_index in range(max(1, rounds)):
-            if round_index:
-                time.sleep(1.0)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for iface_ip in interface_ips:
             try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind((iface_ip, 0))
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
                                 socket.inet_aton(iface_ip))
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
-                sock.settimeout(0.5)
-                for _ in range(3):
-                    sock.sendto(message, (SSDP_ADDR, SSDP_PORT))
-                    time.sleep(0.15)
-                deadline = time.time() + timeout
-                while time.time() < deadline:
-                    try:
-                        data, addr = sock.recvfrom(65535)
-                    except socket.timeout:
-                        continue
-                    except OSError:
-                        break
-                    text = data.decode("utf-8", "replace")
-                    if not text.startswith("HTTP/1.1 200"):
-                        continue
-                    headers = parse_headers(text)
-                    headers["_source"] = addr[0]
-                    headers["_interface"] = iface_ip
-                    log("SSDP response from %s: ST=%s USN=%s LOCATION=%s"
-                        % (addr[0], headers.get("ST", ""), headers.get("USN", ""),
-                           redact(headers.get("LOCATION", ""))))
-                    results.append(headers)
+                sock.setblocking(False)
+                sockets[sock.fileno()] = sock
             except OSError as exc:
                 log("SSDP on %s failed: %s" % (iface_ip, exc))
-            finally:
-                sock.close()
-    return results
+
+        owners = {fd: sock.getsockname()[0] for fd, sock in sockets.items()}
+        deadline = time.time() + timeout
+        for round_index in range(max(1, rounds)):
+            for sock in sockets.values():
+                try:
+                    sock.sendto(message, (SSDP_ADDR, SSDP_PORT))
+                except OSError as exc:
+                    log("SSDP send failed: %s" % exc)
+            # A short gap between rounds, not a full window: the answers to
+            # every round are collected in the loop below.
+            if round_index + 1 < rounds:
+                time.sleep(0.3)
+
+        while sockets and time.time() < deadline:
+            try:
+                ready, _, _ = select.select(list(sockets), [], [], 0.5)
+            except OSError:
+                break
+            for fd in ready:
+                sock = sockets[fd]
+                try:
+                    data, addr = sock.recvfrom(65535)
+                except OSError:
+                    continue
+                text = data.decode("utf-8", "replace")
+                if not text.startswith("HTTP/1.1 200"):
+                    continue
+                headers = parse_headers(text)
+                headers["_source"] = addr[0]
+                headers["_interface"] = owners.get(fd, "")
+                log("SSDP response from %s: ST=%s USN=%s LOCATION=%s"
+                    % (addr[0], headers.get("ST", ""), headers.get("USN", ""),
+                       redact(headers.get("LOCATION", ""))))
+                results.append(headers)
+        return results
+    finally:
+        for sock in sockets.values():
+            sock.close()
 
 
 def unicast_search(
@@ -434,13 +457,19 @@ def scan_hosts(hosts: list[str], ports=SCAN_PORTS,
 def ssdp_listen(
     timeout: float = 6.0,
     interface_ips: list[str] | None = None,
+    quiet_after: float = 1.5,
 ) -> list[dict[str, str]]:
-    """Collect SSDP NOTIFY (ssdp:alive) advertisements for `timeout` seconds.
+    """Collect SSDP NOTIFY (ssdp:alive) advertisements.
 
     The third discovery path: devices announce themselves unprompted, and a
     renderer that ignores M-SEARCH entirely can still be found this way. Needs
     to bind :1900, which fails if another daemon already holds it — treated as
     "no results", never as fatal.
+
+    Stops early once something has been heard *and* the group has gone quiet
+    for `quiet_after` seconds: an SSDP announce arrives in bursts, so waiting
+    out the whole window after the burst is pure latency on the panel's
+    critical path. `timeout` stays as the hard ceiling for a silent network.
     """
     if interface_ips is None:
         interface_ips = [ip for _, ip in local_ipv4_addresses()]
@@ -455,10 +484,13 @@ def ssdp_listen(
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
             except OSError as exc:
                 log("cannot join %s on %s: %s" % (SSDP_ADDR, iface_ip, exc))
-        sock.settimeout(1.0)
+        sock.settimeout(0.5)
         results: list[dict[str, str]] = []
         deadline = time.time() + timeout
+        quiet_until = 0.0
         while time.time() < deadline:
+            if results and time.time() >= quiet_until:
+                break
             try:
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
@@ -473,6 +505,7 @@ def ssdp_listen(
                 continue
             headers["_source"] = addr[0]
             results.append(headers)
+            quiet_until = time.time() + quiet_after
         return results
     except OSError as exc:
         log("SSDP NOTIFY listen unavailable: %s" % exc)
@@ -565,6 +598,7 @@ def discover(
     known_hosts: list[str] | None = None,
     search_targets: tuple[str, ...] = DEFAULT_SEARCH_TARGETS,
     rounds: int = 3,
+    budget: float = 0.0,
 ) -> list[dict]:
     """Find MediaRenderers on the LAN and describe them.
 
@@ -620,11 +654,23 @@ def discover(
     probes.append(("notify", lambda: ssdp_listen(timeout=timeout,
                                                  interface_ips=interface_ips)))
 
-    threads = [threading.Thread(target=run, args=probe) for probe in probes]
+    threads = [threading.Thread(target=run, args=probe, daemon=True)
+               for probe in probes]
     for thread in threads:
         thread.start()
+    # Bounded join. The probes are independently time-limited, but a socket
+    # can still sit in a syscall (a device that keeps broadcasting means
+    # ssdp_listen's quiet window never expires), and discovery sits on the
+    # panel's critical path — it must not be able to hang the UI. Anything
+    # still running when the budget expires is abandoned rather than waited
+    # on; daemon threads die with the process.
+    budget = budget or max(3.0, timeout + 2.0)
     for thread in threads:
-        thread.join()
+        thread.join(timeout=budget)
+    stragglers = [t for t in threads if t.is_alive()]
+    if stragglers:
+        log("%d probe(s) still running after %.0fs; continuing without them"
+            % (len(stragglers), budget))
 
     for kind, found in collected:
         for headers in found:
@@ -638,23 +684,30 @@ def discover(
 
     log("%d SSDP candidate(s)" % len(candidates))
 
-    devices: dict[str, dict] = {}
+    # Descriptions are fetched in parallel. Sequentially, one unreachable
+    # candidate costs a full timeout before the next is even tried — measured
+    # here as most of discovery's wall time, and it lands squarely on the
+    # panel's critical path.
+    seen_locations: list[str] = []
     for headers in candidates.values():
         location = headers.get("LOCATION", "")
-        if not location:
-            continue
-        info = fetch_description(location)
-        if not info:
-            continue
-        if AVTRANSPORT not in info["services"]:
-            log("skipping %s: no AVTransport service"
-                % (info.get("friendlyName") or location))
-            continue
-        device = describe_device(info)
-        key = dedupe_key(device)
-        if key in devices:
-            continue
-        devices[key] = device
+        if location and location not in seen_locations:
+            seen_locations.append(location)
+
+    devices: dict[str, dict] = {}
+    if seen_locations:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(seen_locations))) as pool:
+            for info in pool.map(fetch_description, seen_locations):
+                if not info:
+                    continue
+                if AVTRANSPORT not in info["services"]:
+                    log("skipping %s: no AVTransport service"
+                        % (info.get("friendlyName") or info.get("location", "")))
+                    continue
+                device = describe_device(info)
+                key = dedupe_key(device)
+                devices.setdefault(key, device)
     log("discovered %d renderer(s)" % len(devices))
     return list(devices.values())
 
