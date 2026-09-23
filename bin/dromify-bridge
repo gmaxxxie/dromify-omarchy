@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""dromify-bridge - optional local HTTP range proxy for DLNA playback.
+
+Why this exists
+---------------
+The preferred DLNA path is: renderer does its own `HTTP GET` against
+Navidrome, Dromify only sends it the URL. That works whenever the renderer
+can actually fetch that URL. Measured on a Sony SRS-ZR7:
+
+  * `https://…` stream URL  -> SOAP fault 501 (Action Failed), no playback
+  * the same file over `http://…` -> plays
+
+The ZR7's ConnectionManager sink list advertises no TLS-capable transport,
+so an https Navidrome (the only kind dromify-api allows for a non-loopback
+server — the Subsonic salt+token must not cross a network in the clear) is
+simply not fetchable by the renderer.
+
+This bridge closes that gap without weakening anything: it fetches the
+authenticated upstream URL itself, over TLS, and re-serves the bytes on the
+LAN as plain HTTP with Range support. It is only ever used when a direct
+fetch cannot work, and it is opt-in (`--bridge` / the panel's "via Dromify"
+fallback), never the default.
+
+Security posture
+----------------
+* Binds to a single LAN interface address, never 0.0.0.0: nothing is exposed
+  on other networks or on loopback.
+* Every served path is a random 32-hex token minted by this process. The
+  upstream URL (with its Subsonic salt+token) never appears in a served path,
+  a log line, or an error message.
+* Tokens live in a 0600 state file in $XDG_STATE_HOME/dromify; they are
+  single-purpose and expire with the file.
+* Upstream is fetched with the caller's Range header passed through, so a
+  seek costs one ranged fetch, not a re-download.
+* Idles out: after DROMIFY_BRIDGE_IDLE seconds (default 900) with no
+  requests, the daemon exits on its own.
+
+Usage
+-----
+  dromify-bridge ensure [--iface-ip A.B.C.D] [--port N]
+        start the daemon if needed; print {"ok":true,"base":"http://ip:port"}
+  dromify-bridge urls            # authed URLs on stdin -> local URLs on stdout
+  dromify-bridge status
+  dromify-bridge stop
+  dromify-bridge serve --port N  # run in the foreground (used by ensure)
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import http.server
+import json
+import os
+import re
+import secrets
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "lib"))
+
+import dlna  # noqa: E402
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME",
+                                        os.path.expanduser("~/.local/state")),
+                         "dromify")
+MAP_FILE = os.path.join(STATE_DIR, "bridge-map.json")
+PID_FILE = os.path.join(STATE_DIR, "bridge.json")
+LOG_FILE = os.path.join(STATE_DIR, "bridge.log")
+LOCK_FILE = os.path.join(STATE_DIR, "bridge-map.lock")
+
+TOKEN_RE = re.compile(r"^/s/([0-9a-f]{32})$")
+
+# A *fixed* default port, not an ephemeral one: a home firewall rule is
+# written once against a known port, and a port that changes every start
+# would silently stop working after a reboot. 53317 is unassigned and outside
+# the ephemeral range. Override with --port or DROMIFY_BRIDGE_PORT.
+DEFAULT_PORT = int(os.environ.get("DROMIFY_BRIDGE_PORT", "53317"))
+IDLE_SECONDS = int(os.environ.get("DROMIFY_BRIDGE_IDLE", "900"))
+MAX_TOKENS = 500
+CHUNK = 64 * 1024
+# Never buffer an unbounded upstream response in memory; this is a ceiling on
+# a single track's declared length (2 GiB is far past any real audio file).
+MAX_UPSTREAM_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def fail(msg: str) -> None:
+    print("dromify-bridge: %s" % msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def ensure_state_dir() -> None:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json(path: str, data: dict) -> None:
+    ensure_state_dir()
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class _MapLock:
+    """Serialise read-modify-write of the token map between short-lived CLIs."""
+
+    def __enter__(self):
+        ensure_state_dir()
+        self.fd = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def register_urls(urls: list[str], base: str) -> list[str]:
+    """Mint a local token per upstream URL; return the local URLs."""
+    with _MapLock():
+        mapping = _read_json(MAP_FILE).get("tokens", {})
+        out = []
+        for url in urls:
+            token = None
+            for existing, entry in mapping.items():
+                if entry.get("url") == url:
+                    token = existing
+                    break
+            if token is None:
+                token = secrets.token_hex(16)
+                mapping[token] = {"url": url, "added": time.time()}
+            out.append("%s/s/%s" % (base, token))
+        if len(mapping) > MAX_TOKENS:
+            # Oldest first: the queue only ever needs the current window.
+            ordered = sorted(mapping.items(), key=lambda kv: kv[1].get("added", 0))
+            for token, _ in ordered[:len(mapping) - MAX_TOKENS]:
+                mapping.pop(token, None)
+        _write_json(MAP_FILE, {"tokens": mapping, "updated": time.time()})
+        return out
+
+
+class BridgeHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "Dromify-Bridge/1.0"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):  # never log paths: they are tokens
+        dlna.log("bridge %s" % (fmt % args))
+
+    def _token(self) -> str | None:
+        match = TOKEN_RE.match(self.path.split("?")[0])
+        return match.group(1) if match else None
+
+    def do_HEAD(self) -> None:
+        self._serve(body=False)
+
+    def do_GET(self) -> None:
+        self._serve(body=True)
+
+    def _serve(self, body: bool) -> None:
+        token = self._token()
+        if not token:
+            self.send_error(404)
+            return
+        entry = _read_json(MAP_FILE).get("tokens", {}).get(token)
+        if not entry or not entry.get("url"):
+            self.send_error(404, "unknown or expired token")
+            return
+        self.server.touch()
+
+        headers = {"User-Agent": dlna.USER_AGENT}
+        range_header = self.headers.get("Range")
+        if range_header:
+            headers["Range"] = range_header
+        request = urllib.request.Request(entry["url"], headers=headers)
+        try:
+            upstream = urllib.request.urlopen(request, timeout=30)
+        except urllib.error.HTTPError as exc:
+            dlna.log("upstream HTTP %s" % exc.code)
+            self.send_error(exc.code if exc.code in (404, 416) else 502)
+            return
+        except Exception as exc:  # noqa: BLE001
+            dlna.log("upstream failed: %s: %s" % (type(exc).__name__, exc))
+            self.send_error(502)
+            return
+
+        with upstream:
+            length = upstream.headers.get("Content-Length")
+            ctype = upstream.headers.get("Content-Type") or entry.get("mime") \
+                or "application/octet-stream"
+            self.send_response(upstream.status)
+            self.send_header("Content-Type", ctype)
+            if length:
+                try:
+                    if int(length) > MAX_UPSTREAM_BYTES:
+                        dlna.log("upstream too large")
+                        self.send_error(502)
+                        return
+                except ValueError:
+                    pass
+                self.send_header("Content-Length", length)
+            content_range = upstream.headers.get("Content-Range")
+            if content_range:
+                self.send_header("Content-Range", content_range)
+            self.send_header("Accept-Ranges", "bytes")
+            # DLNA headers: without transferMode.dlna.org a strict renderer
+            # treats the response as a download rather than a stream.
+            self.send_header("transferMode.dlna.org", "Streaming")
+            self.send_header("contentFeatures.dlna.org",
+                             "DLNA.ORG_OP=01;DLNA.ORG_CI=0;"
+                             "DLNA.ORG_FLAGS=01700000000000000000000000000000")
+            self.end_headers()
+            if not body:
+                return
+            sent = 0
+            try:
+                while True:
+                    chunk = upstream.read(CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+                    if sent > MAX_UPSTREAM_BYTES:
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                # The renderer closed the connection (stop, seek, next). Not
+                # an error, and nothing to log beyond debug.
+                dlna.log("client disconnected after %d bytes" % sent)
+
+
+class BridgeServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, addr, handler):
+        super().__init__(addr, handler)
+        self.last_activity = time.time()
+
+    def touch(self) -> None:
+        self.last_activity = time.time()
+
+
+def serve(port: int, iface_ip: str | None) -> None:
+    ensure_state_dir()
+    if not iface_ip:
+        iface_ip = dlna.lan_address_for("1.1.1.1") or "0.0.0.0"
+    try:
+        server = BridgeServer((iface_ip, port), BridgeHandler)
+    except OSError as exc:
+        fail("cannot bind %s:%d (%s). Another process may hold the port; "
+             "pick another with --port." % (iface_ip, port, exc))
+    bound_ip, bound_port = server.server_address[0], server.server_address[1]
+    _write_json(PID_FILE, {"pid": os.getpid(), "addr": bound_ip,
+                           "port": bound_port, "started": time.time()})
+    print(json.dumps({"ok": True, "base": "http://%s:%d" % (bound_ip, bound_port)}),
+          flush=True)
+
+    def reap() -> None:
+        while True:
+            time.sleep(30)
+            if time.time() - server.last_activity > IDLE_SECONDS:
+                dlna.log("idle for %ds, exiting" % IDLE_SECONDS)
+                try:
+                    os.unlink(PID_FILE)
+                except OSError:
+                    pass
+                os._exit(0)
+
+    threading.Thread(target=reap, daemon=True).start()
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        try:
+            os.unlink(PID_FILE)
+        except OSError:
+            pass
+
+
+def running_info() -> dict | None:
+    info = _read_json(PID_FILE)
+    pid = info.get("pid")
+    if not pid:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return None
+        if exc.errno == errno.EPERM:
+            return info
+        return None
+    return info
+
+
+def cmd_ensure(args) -> None:
+    info = running_info()
+    if info:
+        print(json.dumps({"ok": True, "base": "http://%s:%d"
+                          % (info["addr"], info["port"]), "started": False}))
+        return
+    ensure_state_dir()
+    argv = [sys.executable, os.path.abspath(__file__), "serve",
+            "--port", str(args.port)]
+    if args.iface_ip:
+        argv += ["--iface-ip", args.iface_ip]
+    log_fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=log_fd, start_new_session=True)
+    os.close(log_fd)
+    line = proc.stdout.readline().decode("utf-8", "replace").strip()
+    try:
+        payload = json.loads(line)
+    except ValueError:
+        payload = None
+    if not payload or not payload.get("base"):
+        fail("bridge failed to start (see %s)" % LOG_FILE)
+    print(json.dumps({"ok": True, "base": payload["base"], "started": True}))
+
+
+def cmd_urls(args) -> None:
+    info = running_info()
+    if not info:
+        fail("bridge is not running; run: dromify-bridge ensure")
+    base = "http://%s:%d" % (info["addr"], info["port"])
+    urls = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
+    if not urls:
+        return
+    for local in register_urls(urls, base):
+        print(local)
+
+
+def cmd_status(args) -> None:
+    info = running_info()
+    mapping = _read_json(MAP_FILE).get("tokens", {})
+    print(json.dumps({"running": bool(info),
+                      "base": ("http://%s:%d" % (info["addr"], info["port"])) if info else "",
+                      "port": info.get("port") if info else 0,
+                      "tokens": len(mapping)}))
+
+
+def cmd_stop(args) -> None:
+    info = running_info()
+    if not info:
+        print(json.dumps({"ok": True, "stopped": False}))
+        return
+    try:
+        os.kill(int(info["pid"]), 15)
+    except OSError:
+        pass
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
+    try:
+        os.unlink(MAP_FILE)
+    except OSError:
+        pass
+    print(json.dumps({"ok": True, "stopped": True}))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="dromify-bridge", add_help=True)
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("ensure")
+    p.add_argument("--iface-ip", default="")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.set_defaults(func=cmd_ensure)
+
+    p = sub.add_parser("serve")
+    p.add_argument("--iface-ip", default="")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.set_defaults(func=lambda a: serve(a.port, a.iface_ip or None))
+
+    sub.add_parser("urls").set_defaults(func=cmd_urls)
+    sub.add_parser("status").set_defaults(func=cmd_status)
+    sub.add_parser("stop").set_defaults(func=cmd_stop)
+
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        parser.print_help()
+        raise SystemExit(2)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

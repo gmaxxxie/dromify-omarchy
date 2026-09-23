@@ -1,0 +1,135 @@
+#!/bin/bash
+# dromify-output - routes Dromify's transport verbs to the selected output
+# backend: the local mpv instance (bin/dromify-player, unchanged) or a UPnP
+# MediaRenderer (bin/dromify-dlna).
+#
+# Service.qml talks to this script instead of dromify-player directly, so the
+# panel keeps its existing "call a verb, read a status JSON" contract and
+# learns which backend is live from `status`'s `output` field. Adding another
+# backend (Chromecast, AirPlay) means adding a branch here and nothing else.
+#
+# Usage:
+#   dromify-output status
+#   dromify-output output                     # -> {"output":"local"|"dlna"}
+#   dromify-output output local
+#   dromify-output output dlna <udn|name|index>
+#   dromify-output devices [--json]
+#   dromify-output configure --bridge auto|off
+#   dromify-output <any dromify-player / dromify-dlna verb> [args...]
+#
+# stdin is forwarded untouched: the queue payload carries authenticated stream
+# URLs, which must never reach argv.
+
+set -uo pipefail
+
+HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PLAYER="$HERE/dromify-player"
+DLNA="$HERE/dromify-dlna"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dromify"
+OUTPUT_FILE="$STATE_DIR/output"
+
+fail() { echo "dromify-output: $*" >&2; exit 1; }
+
+[[ -x "$PLAYER" ]] || fail "missing helper: $PLAYER"
+[[ -f "$DLNA" ]] || fail "missing helper: $DLNA"
+
+current_output() {
+  local value=""
+  if [[ -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]]; then
+    value="$(cat -- "$OUTPUT_FILE" 2>/dev/null || true)"
+  fi
+  case "$value" in
+    dlna) printf 'dlna' ;;
+    *)    printf 'local' ;;
+  esac
+}
+
+set_output() {
+  mkdir -p "$STATE_DIR" || fail "cannot create $STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  [[ -L "$OUTPUT_FILE" ]] && fail "$OUTPUT_FILE is a symlink; refusing to write"
+  local tmp="$OUTPUT_FILE.tmp.$$"
+  printf '%s\n' "$1" >"$tmp" || fail "cannot write $OUTPUT_FILE"
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$OUTPUT_FILE" || fail "cannot replace $OUTPUT_FILE"
+}
+
+# Local mode reports mpv's own status; DLNA mode reports the renderer's. Both
+# include `output` so the panel can show which one it is talking to and pick
+# the right controls without a second round-trip.
+status() {
+  local mode
+  mode="$(current_output)"
+  if [[ "$mode" == "dlna" ]]; then
+    exec python3 "$DLNA" status "$@"
+  fi
+  # mpv's snapshot doesn't know about output routing; add it so the panel
+  # reads one shape from both backends. `jq` is already a hard dependency of
+  # dromify-player, and a failure here must not lose the snapshot, hence the
+  # `|| cat` fallback.
+  "$PLAYER" status | jq -c '. + {output: "local", renderer: "", state: "", capabilities: []}' \
+    || "$PLAYER" status
+}
+
+case "${1:-}" in
+  output)
+    shift
+    case "${1:-}" in
+      "")
+        printf '{"output":"%s"}\n' "$(current_output)"
+        ;;
+      local)
+        # Switching back to local: leave the renderer alone but stop the
+        # renderer's queue, so a later track change doesn't surprise anyone
+        # with audio from the speaker.
+        python3 "$DLNA" stop >/dev/null 2>&1 || true
+        set_output local
+        printf '{"ok":true,"output":"local"}\n'
+        ;;
+      dlna)
+        shift
+        selector="${1:-}"
+        [[ -n "$selector" ]] || fail "usage: dromify-output output dlna <udn|name|index>"
+        # The local mpv instance is stopped rather than killed: mpv-mpris
+        # should stop advertising a stale MPRIS player while the renderer
+        # plays, and `quit` would also tear down the warm mpv that makes the
+        # next local track start instantly. The output only switches after
+        # the renderer is confirmed, so a bad selector leaves it where it was.
+        "$PLAYER" stop >/dev/null 2>&1 || true
+        python3 "$DLNA" select "$selector" || exit $?
+        set_output dlna
+        printf '{"ok":true,"output":"dlna"}\n'
+        ;;
+      *)
+        fail "unknown output '${1}' (expected: local | dlna <renderer>)"
+        ;;
+    esac
+    ;;
+  devices)
+    shift
+    exec python3 "$DLNA" devices "$@"
+    ;;
+  configure)
+    shift
+    exec python3 "$DLNA" configure "$@"
+    ;;
+  capabilities)
+    shift
+    exec python3 "$DLNA" capabilities "$@"
+    ;;
+  status)
+    shift
+    status "$@"
+    ;;
+  "")
+    fail "usage: dromify-output <status|output|devices|configure|capabilities|load-queue|next|previous|pause|resume|toggle-pause|seek|volume|set-repeat|stop|quit>"
+    ;;
+  *)
+    # Everything else is a transport verb for whichever backend is active.
+    if [[ "$(current_output)" == "dlna" ]]; then
+      exec python3 "$DLNA" "$@"
+    fi
+    exec "$PLAYER" "$@"
+    ;;
+esac

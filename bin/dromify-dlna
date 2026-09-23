@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""dromify-dlna - UPnP/DLNA output backend for Dromify.
+
+Plays a Dromify queue on a standard UPnP MediaRenderer (Sony SRS-ZR7 and
+friends) instead of the local mpv instance. The renderer fetches the audio
+itself; Dromify is only the control point.
+
+This is a peer of bin/dromify-player: same verbs, same stdout contract, so
+Service.qml can drive either one. bin/dromify-output picks between them.
+
+Verbs
+-----
+  devices [--timeout N] [--json]      discover MediaRenderers
+  select <udn|name|index>             choose the active renderer
+  clear                               forget the active renderer
+  configure [--bridge auto|off]       playback options
+  load-queue <startIndex> <count>     queue JSON on stdin (see below)
+  reorder-tail <count>                queue JSON on stdin
+  next | previous | pause | resume | toggle-pause | stop | quit
+  seek <seconds> | volume <0-100> | set-repeat <off|all|one>
+  status                              transport snapshot (JSON)
+  capabilities                        what the renderer says it can do
+  discover-cache                      cached device list, no network
+
+The queue payload on stdin is JSON (never argv: it carries authenticated
+stream URLs):
+
+  {"start": 0, "tracks": [{"id","url","title","artist","album",
+                           "suffix","contentType","duration","size"}, ...]}
+
+Queue ownership mirrors the local backend: this script holds the queue and
+reports an index, Service.qml follows it. mpv owns its queue; a renderer has
+no playlist, so we keep one here and drive the renderer track by track —
+preloading the next item with SetNextAVTransportURI when the device supports
+it, otherwise reacting to STOPPED.
+
+Everything device-specific is capability-driven, not model-driven: the
+renderer's own GetCurrentTransportActions decides which controls are offered,
+and a renderer that can't do Pause reports that instead of pretending.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "lib"))
+
+import dlna  # noqa: E402
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME",
+                                        os.path.expanduser("~/.local/state")),
+                         "dromify")
+STATE_FILE = os.path.join(STATE_DIR, "dlna-state.json")
+CACHE_FILE = os.path.join(STATE_DIR, "dlna-devices.json")
+BRIDGE_BIN = os.path.join(HERE, "dromify-bridge")
+
+# How long a discovery result stays fresh enough to skip a new sweep, and how
+# long a device stays in the list after it was last seen.
+CACHE_TTL = 300
+DEVICE_TTL = 7 * 24 * 3600
+
+# Where the renderer's position must be within a track before we treat a
+# STOPPED state as "the track ended" rather than "someone hit stop".
+END_TOLERANCE = 5.0
+
+
+def fail(msg: str) -> None:
+    print("dromify-dlna: %s" % msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def out(payload: dict) -> None:
+    print(json.dumps(payload))
+
+
+# --- state -------------------------------------------------------------------
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = "%s.tmp.%d" % (STATE_FILE, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    os.replace(tmp, STATE_FILE)
+
+
+def load_cache() -> dict:
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(devices: list[dict]) -> None:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = "%s.tmp.%d" % (CACHE_FILE, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"at": time.time(), "devices": devices}, handle)
+    os.replace(tmp, CACHE_FILE)
+
+
+def merge_devices(known: list[dict], found: list[dict]) -> list[dict]:
+    """Add freshly discovered renderers to the known list, newest wins.
+
+    Keyed by control endpoint (`location`), which identifies one device
+    unambiguously even when a renderer reports different UUIDs in SSDP and in
+    its own description document — as Sony's do.
+    """
+    merged: dict[str, dict] = {}
+    for device in known:
+        merged[dlna.dedupe_key(device)] = device
+    now = time.time()
+    for device in found:
+        entry = dict(device)
+        entry["seen"] = now
+        merged[dlna.dedupe_key(device)] = entry
+    return list(merged.values())
+
+
+def known_hosts() -> list[str]:
+    """Hosts seen in the cache or in ARP — targets for unicast M-SEARCH.
+
+    Multicast discovery silently fails on some networks (AP multicast
+    filtering is common); a unicast probe to hosts we already know about is
+    the cheap way to still find the renderer.
+    """
+    hosts = set()
+    for device in load_cache().get("devices", []):
+        location = device.get("location", "")
+        if "//" in location:
+            hosts.add(location.split("//", 1)[1].split("/")[0].split(":")[0])
+    state = load_state()
+    renderer = state.get("renderer") or {}
+    if renderer.get("location"):
+        hosts.add(renderer["location"].split("//", 1)[1].split("/")[0].split(":")[0])
+    try:
+        result = subprocess.run(["ip", "-4", "neigh", "show"], capture_output=True,
+                                text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0].count(".") == 3:
+                hosts.add(parts[0])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return sorted(h for h in hosts if not h.startswith("127."))
+
+
+def subnet_hosts(prefix: str = "") -> list[str]:
+    """Every host address on the local /24s (the fallback scan's input).
+
+    Only /24s: that is what a home LAN is, and a wider sweep would be a
+    port-scan of somebody else's network. A /16 or larger is refused rather
+    than guessed at.
+    """
+    hosts: list[str] = []
+    for _, ip in dlna.local_ipv4_addresses():
+        parts = ip.split(".")
+        if len(parts) != 4:
+            continue
+        base = ".".join(parts[:3])
+        if prefix and not base.startswith(prefix):
+            continue
+        for last in range(1, 255):
+            candidate = "%s.%d" % (base, last)
+            if candidate != ip:
+                hosts.append(candidate)
+    # De-duplicate while keeping order: two interfaces on the same subnet is
+    # normal (wired + wireless) and must not double every probe.
+    seen: set[str] = set()
+    unique = []
+    for host in hosts:
+        if host not in seen:
+            seen.add(host)
+            unique.append(host)
+    return unique
+
+
+def discover(timeout: float = 6.0, refresh: bool = False) -> list[dict]:
+    """The renderer list, merged with what previous sweeps have seen.
+
+    A sweep is *additive*, never a replacement. SSDP is lossy in practice —
+    measured on this network, a Sony SRS-ZR7 answers roughly one M-SEARCH in
+    six — so a sweep that returns one of two renderers must not make the
+    other disappear from the picker. Devices are kept for DEVICE_TTL and
+    re-confirmed by the next sweep; `select` validates against the device's
+    own control endpoint, so a stale entry fails loudly instead of silently.
+    """
+    cache = load_cache()
+    fresh = cache.get("devices", [])
+    if refresh or not fresh or time.time() - cache.get("at", 0) >= CACHE_TTL:
+        found = dlna.discover(timeout=timeout, known_hosts=known_hosts())
+        fresh = merge_devices(fresh, found)
+        save_cache(fresh)
+        if not found:
+            dlna.log("discovery sweep found nothing; keeping %d cached device(s)"
+                     % len(fresh))
+    return [device for device in fresh
+            if time.time() - device.get("seen", 0) < DEVICE_TTL]
+
+
+def resolve_device(selector: str, timeout: float = 6.0) -> dict | None:
+    devices = discover(timeout=timeout)
+    if selector.isdigit():
+        index = int(selector)
+        if 0 <= index < len(devices):
+            return devices[index]
+        return None
+    wanted = selector.strip().lower()
+    for device in devices:
+        if device.get("udn", "").lower() == wanted:
+            return device
+    for device in devices:
+        if device.get("name", "").lower() == wanted:
+            return device
+    for device in devices:
+        if wanted and wanted in device.get("name", "").lower():
+            return device
+    return None
+
+
+def renderer_for(state: dict) -> dlna.Renderer | None:
+    device = state.get("renderer")
+    if not device or not device.get("avTransportControlURL"):
+        return None
+    return dlna.Renderer(device)
+
+
+# --- stream URL resolution ---------------------------------------------------
+
+
+def bridge_base(state: dict) -> str:
+    """Base URL of the bridge daemon, starting it if needed."""
+    try:
+        result = subprocess.run([sys.executable, BRIDGE_BIN, "ensure"],
+                                capture_output=True, text=True, timeout=20)
+        payload = json.loads(result.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        dlna.log("bridge ensure failed: %s" % exc)
+        return ""
+    return payload.get("base", "")
+
+
+def renderer_urls(state: dict, tracks: list[dict]) -> list[tuple[str, str]]:
+    """[(url the renderer will GET, MIME it will receive)] per track.
+
+    Two decisions are made here, both driven by what the *renderer* says it
+    can do (`ConnectionManager.GetProtocolInfo`), never by the device's name:
+
+    1. **Codec.** A format the renderer does not advertise (measured: a Sony
+       SRS-ZR7 rejects a DSF stream with fault 501) is requested from
+       Navidrome as `?format=mp3` instead. That is the only lossy step in the
+       chain and it is the renderer's own limitation, not a Dromify choice;
+       when the sink list is unknown the original is tried first.
+    2. **Transport.** A renderer that speaks no TLS cannot fetch an `https://`
+       stream URL at all, so with `bridge: auto` (the default) those go
+       through bin/dromify-bridge, which fetches over TLS itself and re-serves
+       plain HTTP on the LAN. `bridge: off` hands the URL over unchanged,
+       which is correct for a plain-http server on the LAN. A loopback server
+       is not renderer-reachable at all, and is reported as such rather than
+       silently rewritten.
+
+    The MIME returned alongside each URL must match what the server will send
+    (including a transcode), because it goes into the DIDL and the renderer
+    validates the response against it.
+    """
+    renderer = renderer_for(state)
+    sink = renderer.protocol_info() if renderer else []
+
+    prepared: list[tuple[str, str]] = []
+    for track in tracks:
+        mime = dlna.guess_mime(track)
+        url = track.get("url", "")
+        if dlna.needs_transcode(track, sink):
+            url = dlna.transcode_url(url)
+            mime = dlna.FALLBACK_MIME
+            dlna.log("renderer does not accept %s; requesting mp3 transcode"
+                     % dlna.guess_mime(track))
+        prepared.append((url, mime))
+
+    mode = state.get("bridge", "auto")
+    if mode == "off":
+        if any(url.startswith("https://") for url, _ in prepared):
+            dlna.log("bridge disabled; sending https URL to renderer as-is")
+        return prepared
+
+    if not any(url.startswith("https://") for url, _ in prepared):
+        return prepared
+
+    base = bridge_base(state)
+    if not base:
+        fail("could not start the stream bridge (needed for an https server); "
+             "run: dromify-bridge ensure")
+    urls = [url for url, _ in prepared]
+    try:
+        result = subprocess.run([sys.executable, BRIDGE_BIN, "urls"],
+                                input="\n".join(urls) + "\n",
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        fail("stream bridge failed: %s" % exc)
+    if result.returncode != 0:
+        fail("stream bridge failed: %s" % (result.stderr or "").strip())
+    local = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(local) != len(urls):
+        fail("stream bridge returned %d URLs for %d tracks" % (len(local), len(urls)))
+    return [(url, prepared[i][1]) for i, url in enumerate(local)]
+
+
+# --- playback ----------------------------------------------------------------
+
+
+def _url_entry(entry) -> tuple[str, str]:
+    """Normalise a queue URI entry to (url, mime).
+
+    Entries are (url, mime) pairs in memory, [url, mime] arrays after a JSON
+    round-trip, and a bare string in state written by an earlier version —
+    all three have to read the same.
+    """
+    if isinstance(entry, (list, tuple)):
+        return (str(entry[0]), str(entry[1]) if len(entry) > 1 else "")
+    return (str(entry or ""), "")
+
+
+def _expected_uri(state: dict, index: int) -> str:
+    uris = state.get("uris", [])
+    if 0 <= index < len(uris):
+        return _url_entry(uris[index])[0]
+    tracks = state.get("tracks", [])
+    if 0 <= index < len(tracks):
+        return tracks[index].get("url", "")
+    return ""
+
+
+def _expected_mime(state: dict, index: int) -> str:
+    uris = state.get("uris", [])
+    if 0 <= index < len(uris):
+        mime = _url_entry(uris[index])[1]
+        if mime:
+            return mime
+    tracks = state.get("tracks", [])
+    if 0 <= index < len(tracks):
+        return dlna.guess_mime(tracks[index])
+    return ""
+
+
+def start_track(state: dict, index: int, preload: bool = True,
+                retry: bool = True) -> dict:
+    """Set + play queue[index], optionally preloading index+1.
+
+    One immediate retry on failure: the ZR7's UPnP stack intermittently
+    rejects an action that succeeds a moment later (observed for
+    SetAVTransportURI, Pause and Seek — its HTTP layer is fine throughout),
+    so a single fault is not evidence that a track is unplayable. A second
+    failure is reported to the caller with the renderer's own error code.
+    """
+    renderer = renderer_for(state)
+    if not renderer:
+        return {"ok": False, "error": "no renderer selected"}
+    tracks = state.get("tracks", [])
+    if not (0 <= index < len(tracks)):
+        return {"ok": False, "error": "track index out of range"}
+
+    track = tracks[index]
+    uri = _expected_uri(state, index)
+    metadata = dlna.didl_lite(uri, track, mime=_expected_mime(state, index))
+    ok, fields = renderer.set_uri(uri, metadata)
+    if not ok and retry:
+        dlna.log("SetAVTransportURI faulted (%s); retrying once"
+                 % fields.get("errorCode", ""))
+        time.sleep(1.0)
+        ok, fields = renderer.set_uri(uri, metadata)
+    if not ok:
+        code = fields.get("errorCode", "")
+        state["lastError"] = "SetAVTransportURI failed (%s)" % code
+        save_state(state)
+        return {"ok": False, "error": state["lastError"],
+                "upnpError": code,
+                "errorDescription": fields.get("errorDescription", "")}
+
+    # Preload the next track when the device offers SetNextAVTransportURI —
+    # gapless-ish hand-off, and it's how the ZR7's own Next button works.
+    preloaded = False
+    if preload and index + 1 < len(tracks):
+        next_uri = _expected_uri(state, index + 1)
+        next_meta = dlna.didl_lite(next_uri, tracks[index + 1],
+                                   mime=_expected_mime(state, index + 1))
+        ok_next, _ = renderer.set_next_uri(next_uri, next_meta)
+        preloaded = ok_next
+
+    ok, fields = renderer.play()
+    if not ok:
+        code = fields.get("errorCode", "")
+        state["lastError"] = "Play failed (%s)" % code
+        save_state(state)
+        return {"ok": False, "error": state["lastError"], "upnpError": code}
+
+    state["index"] = index
+    state["preloaded"] = preloaded
+    state["lastError"] = ""
+    state["updated"] = time.time()
+    save_state(state)
+    return {"ok": True, "index": index, "preloaded": preloaded}
+
+
+def detect_advance(state: dict, transport: dict, position: dict) -> dict | None:
+    """Work out whether the renderer moved on by itself.
+
+    The renderer is the authority, exactly like mpv's playlist-pos is locally.
+    Its TrackURI tells us which queue entry it is actually playing — the
+    renderer reports the URI we gave it, so matching on it survives a manual
+    Next, an auto-advance from the preloaded next item, or the user pressing
+    play on the speaker itself.
+    """
+    tracks = state.get("tracks", [])
+    uris = state.get("uris", [])
+    current = position.get("TrackURI", "")
+    index = state.get("index", -1)
+    if not current:
+        return None
+    for i, entry in enumerate(uris):
+        uri = _url_entry(entry)[0]
+        if uri and uri == current:
+            if i != index:
+                return {"index": i, "reason": "uri-match"}
+            return None
+    # The renderer is playing something we didn't queue (its own input
+    # source, or a URL from a previous Dromify session). Don't fake an index.
+    dlna.log("renderer TrackURI not in queue: %s" % dlna.redact(current))
+    return None
+
+
+def advance_after_end(state: dict, position: dict) -> dict:
+    """The preloaded next track ended the queue, or nothing was preloaded."""
+    index = state.get("index", -1)
+    tracks = state.get("tracks", [])
+    if index + 1 < len(tracks):
+        return start_track(state, index + 1)
+    state["ended"] = True
+    state["lastError"] = ""
+    save_state(state)
+    return {"ok": True, "ended": True}
+
+
+def cmd_devices(args) -> None:
+    devices = discover(timeout=args.timeout, refresh=not args.cached)
+    if args.scan:
+        # Fallback for a renderer whose SSDP responder is broken or filtered:
+        # an explicit sweep of the local /24s. User-initiated only — it is a
+        # burst of connections, not something to do on every panel open.
+        hosts = subnet_hosts(args.scan_prefix)
+        if not hosts:
+            fail("no local /24 to scan")
+        dlna.log("scanning %d host(s)" % len(hosts))
+        found = dlna.scan_hosts(hosts, timeout=args.scan_timeout)
+        devices = merge_devices(devices, found)
+        save_cache(devices)
+    if args.json:
+        out({"ok": True, "devices": devices})
+        return
+    for i, device in enumerate(devices):
+        print("%d\t%s\t%s\t%s" % (i, device.get("name", ""),
+                                  device.get("manufacturer", ""),
+                                  device.get("udn", "")))
+    if not devices:
+        print("no MediaRenderers found", file=sys.stderr)
+
+
+def cmd_select(args) -> None:
+    device = resolve_device(args.selector, timeout=args.timeout)
+    if not device:
+        fail("no renderer matching %r (run: dromify-dlna devices)" % args.selector)
+    state = load_state()
+    state["renderer"] = device
+    state["index"] = state.get("index", -1)
+    state["lastError"] = ""
+    save_state(state)
+    dlna.log("selected renderer %s (%s)" % (device.get("name"), device.get("udn")))
+    out({"ok": True, "renderer": device,
+         "capabilities": dlna.Renderer(device).current_actions()})
+
+
+def cmd_clear(args) -> None:
+    state = load_state()
+    state.pop("renderer", None)
+    state["tracks"] = []
+    state["uris"] = []
+    state["index"] = -1
+    save_state(state)
+    out({"ok": True})
+
+
+def cmd_configure(args) -> None:
+    state = load_state()
+    if args.bridge:
+        state["bridge"] = args.bridge
+    if args.timeout:
+        state["timeout"] = args.timeout
+    save_state(state)
+    out({"ok": True, "bridge": state.get("bridge", "auto")})
+
+
+def cmd_load_queue(args) -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError as exc:
+        fail("queue payload is not JSON: %s" % exc)
+    tracks = payload.get("tracks") or []
+    if not tracks:
+        fail("queue payload has no tracks")
+    state = load_state()
+    if not state.get("renderer"):
+        fail("no renderer selected (run: dromify-dlna select <device>)")
+    state["tracks"] = tracks
+    state["uris"] = renderer_urls(state, tracks)
+    state["ended"] = False
+    index = int(payload.get("start") or 0)
+    if not 0 <= index < len(tracks):
+        index = 0
+    result = start_track(state, index)
+    if not result.get("ok"):
+        out({"ok": False, "error": result.get("error", "playback failed"),
+             "upnpError": result.get("upnpError", "")})
+        return
+    out({"ok": True, "index": index})
+
+
+def cmd_reorder_tail(args) -> None:
+    """Replace the not-yet-played tail of the queue (shuffle).
+
+    The currently playing entry is never re-set: on a renderer that would
+    restart the stream from zero. Its URIs stay valid because the head of the
+    queue is untouched.
+    """
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError as exc:
+        fail("queue payload is not JSON: %s" % exc)
+    tracks = payload.get("tracks") or []
+    state = load_state()
+    index = int(payload.get("start") or state.get("index") or 0)
+    if not tracks:
+        fail("queue payload has no tracks")
+    # Rebuild the tail while keeping the head (history + current) as it was.
+    old_tracks = state.get("tracks", [])
+    old_uris = state.get("uris", [])
+    head_tracks = old_tracks[:index + 1]
+    head_uris = old_uris[:index + 1]
+    tail = tracks[index + 1:]
+    tail_uris = renderer_urls(state, tail)
+    state["tracks"] = head_tracks + tail
+    state["uris"] = head_uris + tail_uris
+    state["index"] = index
+    # Re-preload: the previously preloaded next entry is no longer next.
+    renderer = renderer_for(state)
+    if renderer and index + 1 < len(state["tracks"]):
+        next_uri = _expected_uri(state, index + 1)
+        renderer.set_next_uri(next_uri, dlna.didl_lite(
+            next_uri, state["tracks"][index + 1], mime=_expected_mime(state, index + 1)))
+    save_state(state)
+    out({"ok": True})
+
+
+def _simple(action: str, fn_name: str) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    ok, fields = getattr(renderer, fn_name)()
+    if not ok:
+        code = fields.get("errorCode", "")
+        desc = fields.get("errorDescription", "")
+        out({"ok": False, "error": "%s failed (%s)" % (action, code or desc),
+             "upnpError": code})
+        return
+    out({"ok": True})
+
+
+def cmd_next(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    if "Next" in renderer.current_actions():
+        _simple("Next", "next")
+        return
+    # No renderer-side Next: move the queue ourselves.
+    index = state.get("index", -1) + 1
+    if index >= len(state.get("tracks", [])):
+        out({"ok": False, "error": "end of queue"})
+        return
+    out(start_track(state, index))
+
+
+def cmd_previous(args) -> None:
+    """Always driven by this script, never delegated to the renderer.
+
+    UPnP leaves Previous device-defined, and the common interpretation is
+    "restart the current track" rather than "go back one". Measured on an
+    SRS-ZR7: its Previous action returns success and does nothing at all —
+    the track keeps playing from where it was. Since the panel's Previous
+    button means "the track before this one", the queue is moved here.
+    """
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    index = max(0, state.get("index", 0) - 1)
+    out(start_track(state, index))
+
+
+def cmd_pause(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    actions = renderer.current_actions()
+    if actions and "Pause" not in actions:
+        out({"ok": False, "unsupported": "Pause",
+             "error": "this renderer does not support Pause"})
+        return
+    ok, fields = renderer.pause()
+    if not ok:
+        out({"ok": False, "unsupported": "Pause",
+             "error": "Pause failed (%s)" % fields.get("errorCode", "")})
+        return
+    state["paused"] = True
+    save_state(state)
+    out({"ok": True})
+
+
+def cmd_resume(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    ok, fields = renderer.play()
+    if not ok:
+        out({"ok": False, "error": "Play failed (%s)" % fields.get("errorCode", "")})
+        return
+    state["paused"] = False
+    save_state(state)
+    out({"ok": True})
+
+
+def cmd_toggle_pause(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    info = renderer.transport_info()
+    if info.get("CurrentTransportState") == "PAUSED_PLAYBACK":
+        cmd_resume(args)
+    else:
+        cmd_pause(args)
+
+
+def cmd_stop(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if renderer:
+        renderer.stop()
+    state["tracks"] = []
+    state["uris"] = []
+    state["index"] = -1
+    state["ended"] = False
+    state["paused"] = False
+    save_state(state)
+    out({"ok": True})
+
+
+def cmd_quit(args) -> None:
+    cmd_stop(args)
+
+
+def cmd_seek(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    actions = renderer.current_actions()
+    if actions and "Seek" not in actions:
+        out({"ok": False, "unsupported": "Seek",
+             "error": "this renderer does not support Seek"})
+        return
+    ok, fields = renderer.seek(int(args.seconds))
+    if not ok:
+        out({"ok": False, "unsupported": "Seek",
+             "error": "Seek failed (%s)" % fields.get("errorCode", "")})
+        return
+    out({"ok": True})
+
+
+def cmd_volume(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    if not renderer.set_volume(int(args.value)):
+        out({"ok": False, "error": "SetVolume failed (no RenderingControl?)"})
+        return
+    out({"ok": True})
+
+
+def cmd_set_repeat(args) -> None:
+    # A renderer has no loop properties; repeat is honoured by this script's
+    # own advance logic (see cmd_status).
+    state = load_state()
+    state["repeat"] = args.mode
+    save_state(state)
+    out({"ok": True, "repeat": args.mode})
+
+
+def cmd_capabilities(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    if not renderer:
+        fail("no renderer selected")
+    out({"ok": True,
+         "capabilities": renderer.current_actions(),
+         "protocolInfo": renderer.protocol_info(),
+         "volume": renderer.volume()})
+
+
+def _newly_finished(state: dict, track, position: dict, duration: float,
+                    elapsed: float) -> str:
+    """The id of the track a *previous* status call saw end, if not yet reported.
+
+    Scrobbling has to survive the gap between two polls: when the renderer
+    auto-advances through a preloaded next item it never reports STOPPED, so
+    the finished track is only ever visible as "the URI changed since last
+    time". Recording the transition here means the QML side can report it
+    exactly once, on whichever poll notices.
+    """
+    if state.get("finishedId") and not state.get("scrobbled"):
+        return state["finishedId"]
+    return ""
+
+
+def cmd_status(args) -> None:
+    state = load_state()
+    renderer = renderer_for(state)
+    tracks = state.get("tracks", [])
+    index = state.get("index", -1)
+    track = tracks[index] if 0 <= index < len(tracks) else None
+
+    if not renderer:
+        out({
+            "running": False, "paused": True, "position": 0, "duration": 0,
+            "idle": True, "eof": False, "volume": 100, "path": "",
+            "playlistPos": -1, "playlistCount": 0, "audioCodec": "",
+            "audioBitrate": 0, "output": "dlna", "renderer": "",
+            "state": "NO_RENDERER", "capabilities": [],
+            "error": state.get("lastError", ""),
+        })
+        return
+
+    transport = renderer.transport_info()
+    position = renderer.position_info()
+    media = renderer.media_info()
+    tstate = transport.get("CurrentTransportState", "")
+    actions = renderer.current_actions()
+
+    # Follow the renderer, not our own last command: match the URI it is
+    # actually playing against the queue.
+    moved = detect_advance(state, transport, position)
+    if moved:
+        old_track = tracks[index] if 0 <= index < len(tracks) else None
+        index = moved["index"]
+        state["index"] = index
+        state["ended"] = False
+        # Hand the finished track to the caller for scrobbling exactly once.
+        # It cannot be scrobbled here: these scripts hold no credentials and
+        # never talk to the server, by design (same split as dromify-player).
+        if old_track and old_track.get("id"):
+            state["finishedId"] = old_track["id"]
+            state["scrobbled"] = ""
+        save_state(state)
+        dlna.log("renderer moved to queue index %d (%s)" % (index, moved["reason"]))
+
+    # A STOPPED renderer at (or past) the end of a track means it finished and
+    # there was no preloaded next item — advance the queue ourselves. A STOPPED
+    # renderer near position 0 means a real stop, which must not auto-advance.
+    elapsed = dlna.parse_hms(position.get("RelTime", ""))
+    duration = dlna.sane_duration(position.get("TrackDuration", ""),
+                                  (track or {}).get("duration"))
+    if tstate == "STOPPED" and not state.get("ended") and track:
+        finished = duration > 0 and elapsed >= max(0.0, duration - END_TOLERANCE)
+        if finished:
+            dlna.log("track finished (%.1fs of %.1fs); advancing" % (elapsed, duration))
+            repeat = state.get("repeat", "off")
+            if track.get("id"):
+                state["finishedId"] = track["id"]
+                state["scrobbled"] = ""
+            if repeat == "one":
+                start_track(state, index, preload=False)
+            elif index + 1 < len(tracks):
+                start_track(state, index + 1)
+            elif repeat == "all":
+                start_track(state, 0)
+            else:
+                state["ended"] = True
+                save_state(state)
+            transport = renderer.transport_info()
+            position = renderer.position_info()
+            tstate = transport.get("CurrentTransportState", tstate)
+
+    paused = tstate == "PAUSED_PLAYBACK"
+    playing = tstate == "PLAYING"
+    track = tracks[index] if 0 <= index < len(tracks) else None
+    suffix = str((track or {}).get("suffix") or "").lower()
+    codec = suffix if suffix else ""
+    bitrate = int((track or {}).get("bitRate") or 0) * 1000
+
+    finished_id = state.get("finishedId", "")
+    if finished_id:
+        state["scrobbled"] = finished_id
+        save_state(state)
+
+    out({
+        "running": bool(track) and tstate not in ("", "NO_MEDIA_PRESENT"),
+        "paused": paused or tstate in ("STOPPED", "NO_MEDIA_PRESENT"),
+        "position": elapsed,
+        "duration": duration,
+        "idle": tstate in ("", "NO_MEDIA_PRESENT"),
+        "eof": bool(state.get("ended")),
+        "volume": renderer.volume() if args.volume else 100,
+        "path": (track or {}).get("title", ""),
+        "playlistPos": index,
+        "playlistCount": len(tracks),
+        "audioCodec": codec,
+        "audioBitrate": bitrate,
+        "output": "dlna",
+        "renderer": renderer.name,
+        "state": tstate,
+        "capabilities": actions,
+        "preloaded": bool(state.get("preloaded")),
+        "finishedId": finished_id,
+        "error": state.get("lastError", ""),
+    })
+
+
+def cmd_discover_cache(args) -> None:
+    cache = load_cache()
+    out({"ok": True, "at": cache.get("at", 0),
+         "devices": cache.get("devices", [])})
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="dromify-dlna")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("devices")
+    p.add_argument("--timeout", type=float, default=6.0)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--cached", action="store_true", help="cache only, no sweep")
+    p.add_argument("--scan", action="store_true",
+                   help="also sweep the local /24s for a renderer that does "
+                        "not answer SSDP")
+    p.add_argument("--scan-prefix", default="",
+                   help="limit --scan to subnets starting with this prefix, e.g. 192.168.1")
+    p.add_argument("--scan-timeout", type=float, default=1.2)
+    p.set_defaults(func=cmd_devices)
+
+    p = sub.add_parser("select")
+    p.add_argument("selector")
+    p.add_argument("--timeout", type=float, default=6.0)
+    p.set_defaults(func=cmd_select)
+
+    sub.add_parser("clear").set_defaults(func=cmd_clear)
+
+    p = sub.add_parser("configure")
+    p.add_argument("--bridge", choices=("auto", "off"), default="")
+    p.add_argument("--timeout", type=float, default=0)
+    p.set_defaults(func=cmd_configure)
+
+    p = sub.add_parser("load-queue")
+    p.add_argument("start", nargs="?", default="0")
+    p.add_argument("count", nargs="?", default="")
+    p.set_defaults(func=cmd_load_queue)
+
+    p = sub.add_parser("reorder-tail")
+    p.add_argument("count", nargs="?", default="")
+    p.set_defaults(func=cmd_reorder_tail)
+
+    sub.add_parser("next").set_defaults(func=cmd_next)
+    sub.add_parser("previous").set_defaults(func=cmd_previous)
+    sub.add_parser("pause").set_defaults(func=cmd_pause)
+    sub.add_parser("resume").set_defaults(func=cmd_resume)
+    sub.add_parser("toggle-pause").set_defaults(func=cmd_toggle_pause)
+    sub.add_parser("stop").set_defaults(func=cmd_stop)
+    sub.add_parser("quit").set_defaults(func=cmd_quit)
+
+    p = sub.add_parser("seek")
+    p.add_argument("seconds")
+    p.set_defaults(func=cmd_seek)
+
+    p = sub.add_parser("volume")
+    p.add_argument("value")
+    p.set_defaults(func=cmd_volume)
+
+    p = sub.add_parser("set-repeat")
+    p.add_argument("mode", choices=("off", "all", "one"))
+    p.set_defaults(func=cmd_set_repeat)
+
+    p = sub.add_parser("status")
+    p.add_argument("--volume", action="store_true",
+                   help="also query RenderingControl volume (extra round-trip)")
+    p.set_defaults(func=cmd_status)
+
+    sub.add_parser("capabilities").set_defaults(func=cmd_capabilities)
+    sub.add_parser("discover-cache").set_defaults(func=cmd_discover_cache)
+
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        parser.print_help()
+        raise SystemExit(2)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
