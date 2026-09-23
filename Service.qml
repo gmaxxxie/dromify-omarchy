@@ -1217,7 +1217,35 @@ Item {
     _run(outputProcess, [outputBin, "output"], function(data, err) {
       if (data && data.output) output = data.output
       if (callback) callback(output, err)
+      // Knowing the output is "dlna" without knowing *which* renderer leaves
+      // the panel showing an empty name after a shell restart — the backend
+      // still has it, so ask. One extra call, only when it matters.
+      if (root.dlnaActive && root.dlnaRenderer === "") _adoptRenderer()
     })
+  }
+
+  // Reads back the renderer the backend already has selected.
+  function _adoptRenderer() {
+    _run(rendererInfoProcess, [outputBin, "status"], function(data, err) {
+      if (!data) return
+      if (data.renderer) dlnaRenderer = data.renderer
+      if (data.capabilities) dlnaCapabilities = data.capabilities
+      if (data.state !== undefined) dlnaState = data.state || ""
+    })
+  }
+
+  Process {
+    id: rendererInfoProcess
+    property var _cb: null
+    running: false
+    stdout: StdioCollector { id: rendererInfoOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      var cb = rendererInfoProcess._cb; rendererInfoProcess._cb = null
+      if (!cb) return
+      var data = null
+      try { data = JSON.parse(rendererInfoOut.text) } catch (e) { /* leave null */ }
+      cb(data, exitCode === 0 ? "" : "status failed")
+    }
   }
 
   // Two-phase on purpose: the cached list is instant, a sweep is not (6-8s on
@@ -1431,6 +1459,16 @@ Item {
     target: "dromifyService"
 
     function events(): string { return root.events() }
+
+    // Clear the sticky error fields. They can hold something from an earlier
+    // session (a failed request minutes ago) which then reads like a current
+    // problem; a user reporting "it says X but it is playing fine" is usually
+    // looking at exactly that.
+    function clearErrors(): string {
+      root.lastError = ""
+      root.outputError = ""
+      return "cleared"
+    }
 
     function state(): string {
       return JSON.stringify({
