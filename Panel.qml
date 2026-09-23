@@ -384,9 +384,12 @@ Panel {
                   textFormat: Text.PlainText
                   Layout.fillWidth: true
                   wrapMode: Text.WordWrap
-                  text: insecureLanOn
-                    ? "On. " + String(nav.activeProfile.serverURL).replace(/\/$/, "") + " is trusted; nothing plays over https from it."
-                    : "Off. " + String(nav.activeProfile.serverURL).replace(/\/$/, "") + " will refuse to play until this is on, because its login token is replayable."
+                  text: {
+                    var url = String((nav.activeProfile && nav.activeProfile.serverURL) || "").replace(/\/$/, "")
+                    return insecureLanOn
+                      ? ("On. " + url + " is trusted; nothing plays over https from it.")
+                      : ("Off. " + url + " will refuse to play until this is on, because its login token is replayable.")
+                  }
                   color: insecureLanOn ? Color.accent : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
