@@ -17,8 +17,13 @@
 #   dromify-output configure --bridge auto|off
 #   dromify-output <any dromify-player / dromify-dlna verb> [args...]
 #
-# stdin is forwarded untouched: the queue payload carries authenticated stream
-# URLs, which must never reach argv.
+# stdin carries the queue; it is never argv. The payload is one JSON document
+# (url + the song's metadata, so a DLNA backend can build DIDL and decide
+# whether the renderer can play the source codec at all), and this script
+# translates it into whatever the selected backend wants — newline-paired
+# url/title records for mpv. Keeping the translation here is what lets the
+# local backend stay untouched, and means a future backend adds one adapter
+# rather than a change to Service.qml.
 
 set -uo pipefail
 
@@ -30,6 +35,24 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dromify"
 OUTPUT_FILE="$STATE_DIR/output"
 
 fail() { echo "dromify-output: $*" >&2; exit 1; }
+
+# Reads the queue JSON from stdin and prints mpv's url/title line pairs.
+# Field count is taken from the payload, not from argv: the panel passes a
+# count too, but trusting one source avoids a mismatch silently queueing the
+# wrong number of tracks. The authenticated stream URLs are read here and
+# written straight on to the child's stdin — never to a file, never to argv.
+queue_json_to_pairs() {
+  command -v jq >/dev/null 2>&1 || fail "'jq' is required but not found on PATH"
+  local payload
+  payload="$(cat)" || fail "could not read the queue payload"
+  [[ -n "$payload" ]] || fail "empty queue payload"
+  printf '%s' "$payload" | jq -r '
+    if (.tracks | type) != "array" then error("queue payload has no tracks array")
+    else .tracks[] | [(.url // ""), ((.title // "") | gsub("[\r\n]+"; " "))] | @tsv end
+  ' | while IFS=$'\t' read -r url title; do
+        printf '%s\n%s\n' "$url" "$title"
+      done
+}
 
 [[ -x "$PLAYER" ]] || fail "missing helper: $PLAYER"
 [[ -f "$DLNA" ]] || fail "missing helper: $DLNA"
@@ -105,6 +128,22 @@ case "${1:-}" in
         fail "unknown output '${1}' (expected: local | dlna <renderer>)"
         ;;
     esac
+    ;;
+  load-queue)
+    shift
+    if [[ "$(current_output)" == "dlna" ]]; then
+      exec python3 "$DLNA" load-queue "$@"
+    fi
+    # The count argument is preserved: dromify-player validates it against the
+    # payload it is about to read, which is exactly the check worth keeping.
+    exec "$PLAYER" load-queue "$@" < <(queue_json_to_pairs)
+    ;;
+  reorder-tail)
+    shift
+    if [[ "$(current_output)" == "dlna" ]]; then
+      exec python3 "$DLNA" reorder-tail "$@"
+    fi
+    exec "$PLAYER" reorder-tail "$@" < <(queue_json_to_pairs)
     ;;
   devices)
     shift
