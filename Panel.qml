@@ -38,7 +38,7 @@ Panel {
   // shared one shows up, at which point every binding here re-evaluates
   // and switches over on its own.
   readonly property var nav: (bar && bar.shell && bar.shell.firstPartyServiceFor("tallahootie.dromify")) || _localNav
-  Service { id: _localNav }
+  Service { id: _localNav; exposeIpc: false }
 
   // --- per-instance keyboard focus / scroll ---------------------------------
   // Everything about *what* is being browsed (tabs, drill-down, search,
@@ -290,7 +290,7 @@ Panel {
             tooltipText: nav.dlnaActive ? ("Output: " + nav.dlnaRenderer) : "Output"
             foreground: nav.dlnaActive ? Color.accent : root.foreground
             fontFamily: root.fontFamily
-            onClicked: outputPanel.opened = !outputPanel.opened
+            onClicked: outputPanel.open = !outputPanel.open
           }
 
           PanelActionButton {
@@ -1278,7 +1278,7 @@ Panel {
           tooltipText: "Close"
           foreground: root.foreground
           fontFamily: root.fontFamily
-          onClicked: outputPanel.opened = false
+          onClicked: outputPanel.open = false
         }
       }
 
@@ -1346,7 +1346,7 @@ Panel {
 
     // Refresh on open: renderers come and go, and the list is cheap from cache
     // with the sweep running behind it.
-    onOpenedChanged: if (opened) nav.refreshDevices()
+    onOpenChanged: if (open) nav.refreshDevices()
   }
 
   component OutputRow: CursorSurface {

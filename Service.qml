@@ -81,11 +81,8 @@ Item {
   property var queue: []
   property int queueIndex: -1
   readonly property var currentSong: (queueIndex >= 0 && queueIndex < queue.length) ? queue[queueIndex] : null
-  // True from the moment a track is requested until mpv confirms it loaded.
-  // playFrom refuses to start a second load while one is in flight, so
-  // spamming next/prev can't race two loads and leave `queue`/`queueIndex`
-  // (updated optimistically, for instant UI feedback) pointing at a track
-  // mpv never actually loaded.
+  // True from the moment a track is requested until the active backend
+  // confirms it loaded (or reports an error).
   property bool loading: false
 
   // Repeat is delegated to mpv's own loop-playlist/loop-file properties
@@ -596,47 +593,29 @@ Item {
   // mpv's own playlist is the queue: load-queue hands it every track's
   // stream URL up front, so its native playlist-next/prev (and therefore
   // MPRIS Next/Previous — what hardware media keys and `playerctl` actually
-  // call) work correctly. `queueIndex` isn't tracked optimistically; the
-  // status poll reads mpv's real `playlist-pos` back and that's what moves
-  // `queueIndex`, so in-app buttons, media keys, and playerctl all stay in
-  // sync through the same source of truth.
+  // call) work correctly. `queueIndex` updates optimistically when a track
+  // is requested, then status polls reconcile it with the active backend.
 
-  // Bumped on every playFrom call; an in-flight call's async steps check
-  // their own generation against this before applying anything, so clicking
-  // a second track while the first is still loading (a real possibility —
-  // mpv's very first cold start can take a couple of seconds) makes the
-  // second click *win* instead of being silently dropped, or worse, having
-  // the first click's now-stale result land after it and clobber the
-  // second track's state. Previously this used a plain `loading` guard that
-  // rejected the second click outright, which looked exactly like "clicking
-  // any track plays the wrong one" — the click wasn't misrouted, it was
-  // just ignored with no feedback.
+  // A newer selection supersedes the older one. Shared Process objects can
+  // only run one command at a time, so retain the latest selection until
+  // both the URL and queue processes are free.
   property int _playGen: 0
+  property var _pendingPlay: null
 
-  // Interleaves urls with each song's title label for dromify-player
-  // load-queue, which bakes each one in as that playlist entry's own
-  // force-media-title — see the long comment on cmd_load_queue for why
-  // that beats setting the current title reactively after a skip. Just
-  // the title, not "Artist – Title": mpv-mpris's own Artist tag is synced
-  // just as correctly (same per-file timing), and the system media widget
-  // appends it after this title itself, so folding the artist in here too
-  // made it show up twice.
-  // Builds the stdin payload for dromify-player load-queue / reorder-tail:
-  // url and title on their own lines, one pair per track. The stream URLs
-  // carry the Subsonic salt+token, so they go over stdin, never argv (see
-  // _runWithSecret). Titles are forced onto a single line — they're only a
-  // cosmetic force-media-title, and a newline would desync the pairing.
-  // Builds the stdin payload for dromify-player load-queue / reorder-tail:
-  // url and title on their own lines, one pair per track. The stream URLs
-  // carry the Subsonic salt+token, so they go over stdin, never argv (see
-  // _runWithSecret). Titles are forced onto a single line — they're only a
-  // cosmetic force-media-title, and a newline would desync the pairing.
+  // One JSON record per song for dromify-output. The router gives mpv the
+  // title as a per-entry label and gives DLNA the source MIME and metadata;
+  // without contentType, a non-MP3 stream is incorrectly declared as MP3.
+  // Stream URLs carry a replayable Subsonic token, so this stays on stdin.
   function _queuePayload(songs, urls) {
     var lines = []
     for (var i = 0; i < urls.length; i++) {
-      var title = songs[i] ? Model.nowPlayingLabel(songs[i]) : ""
-      lines.push(urls[i])
-      lines.push(String(title).replace(/[\r\n]+/g, " "))
+      var song = songs[i] || {}
+      lines.push(JSON.stringify({
+        url: urls[i], title: Model.nowPlayingLabel(song), id: song.id,
+        artist: song.artist, album: song.album, duration: song.duration,
+        size: song.size, track: song.track, contentType: song.contentType,
+        suffix: song.suffix
+      }))
     }
     return lines.join("\n")
   }
@@ -654,15 +633,28 @@ Item {
     _unshuffledQueue = null
     var gen = ++_playGen
     loading = true
+    lastError = ""
+    outputError = ""
     queue = songs
     queueIndex = startIndex
+    _pendingPlay = { songs: songs, startIndex: startIndex, gen: gen }
+    _drainPendingPlay()
+  }
+
+  function _drainPendingPlay() {
+    if (!_pendingPlay || loadProcess.running || playQueueProcess.running) return
+    var request = _pendingPlay
+    _pendingPlay = null
+    var songs = request.songs
+    var startIndex = request.startIndex
+    var gen = request.gen
     var ids = songs.map(function(s) { return s.id })
-    _run(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
+    var started = _run(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
       if (gen !== _playGen) return
       if (err || !urlsOut) { lastError = err || "could not build stream URLs"; loading = false; return }
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
-      _runWithSecret(playQueueProcess,
+      var queued = _runWithSecret(playQueueProcess,
                      [outputBin, "load-queue", String(startIndex), String(urls.length)],
                      _queuePayload(songs, urls),
                      function(data, err) {
@@ -685,8 +677,16 @@ Item {
         pollTimer.restart()
         pollNow()
       })
-      _apiGet(["scrobble.view", "id=" + songs[startIndex].id, "submission=false"], function() {})
+      if (!queued) {
+        _pendingPlay = request
+        logEvent("playFrom queued", "waiting for the previous queue request")
+      }
+      else _apiGet(["scrobble.view", "id=" + songs[startIndex].id, "submission=false"], function() {})
     })
+    if (!started) {
+      _pendingPlay = request
+      logEvent("playFrom queued", "waiting for stream URLs")
+    }
   }
 
   function togglePause() {
@@ -768,19 +768,30 @@ Item {
     if (tail.length === 0) return
     loading = true
     var ids = tail.map(function(s) { return s.id })
-    _run(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
+    var started = _run(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
       if (gen !== _playGen) return
       if (err || !urlsOut) { lastError = err || "could not build stream URLs"; loading = false; return }
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
-      _runWithSecret(playQueueProcess,
+      var queued = _runWithSecret(playQueueProcess,
                      [outputBin, "reorder-tail", String(urls.length)],
                      _queuePayload(newQueue, urls),
                      function() {
         if (gen !== _playGen) return
         loading = false
       })
+      if (!queued) {
+        lastError = "another playback request is still being applied"
+        outputError = lastError
+        logEvent("reorder-tail dropped", lastError)
+        loading = false
+      }
     })
+    if (!started) {
+      lastError = "another playback request is still preparing stream URLs"
+      logEvent("reorder-tail dropped", lastError)
+      loading = false
+    }
   }
 
   function seekFraction(fraction) {
@@ -886,6 +897,7 @@ Item {
       // has processed those commands. Skip the whole update rather than
       // just the queueIndex sync: position/duration for the old track
       // would be just as misleading to show for that one tick.
+      if (root.loading) return
       var data = null
       try { data = JSON.parse(pollOut.text) } catch (e) { return }
       if (!data) return
@@ -1080,10 +1092,8 @@ Item {
         configureProcess.write(configureProcess._secret + "\n")
         configureProcess._secret = ""
       }
-      // Same reason as playQueueProcess above: dromify-api reads the password
-      // as one line so it does not need EOF, but a helper must never be left
-      // holding a pipe that is closed only when this object is destroyed.
-      configureProcess.stdinEnabled = false
+      // dromify-api reads exactly one password line. Keep stdin available
+      // when this Process is reused for a later configure or relogin.
     }
     onExited: function(exitCode) {
       configureProcess._secret = ""
@@ -1123,6 +1133,7 @@ Item {
     stdout: StdioCollector { id: loadOut; waitForEnd: true }
     stderr: StdioCollector { id: loadErr; waitForEnd: true }
     onExited: function(exitCode) {
+      Qt.callLater(root._drainPendingPlay)
       var cb = loadProcess._cb; loadProcess._cb = null
       if (exitCode === 0 && root._overSized(loadOut.text)) {
         if (cb) cb("", "stream URL list too large")
@@ -1161,16 +1172,11 @@ Item {
         playQueueProcess.write(playQueueProcess._secret + "\n")
         playQueueProcess._secret = ""
       }
-      // Close stdin now that the payload is in. Quickshell does NOT close it
-      // on its own, and the backend reads the queue from stdin — so without
-      // this the helper consumes the payload, does its work, and then blocks
-      // forever waiting for an EOF that never comes. The process never exits,
-      // the panel never sees its answer, and the track never starts. (The
-      // local backend reads a fixed number of lines so it never needed the
-      // EOF; the DLNA backend's JSON read does.)
-      playQueueProcess.stdinEnabled = false
+      // The router reads the declared number of JSON records, so this
+      // pipe may stay open. Keep stdin enabled for the next playback request.
     }
     onExited: function(exitCode) {
+      Qt.callLater(root._drainPendingPlay)
       playQueueProcess._secret = ""
       var cb = playQueueProcess._cb; playQueueProcess._cb = null
       if (!cb) return
@@ -1547,6 +1553,13 @@ Item {
         if (songs.length) root.playFrom(songs, 0)
       })
       return "playing " + albumId
+    }
+
+    // Exercise the same path as clicking a song in the current queue.
+    function playQueueIndex(index: int): string {
+      if (index < 0 || index >= root.queue.length) return "invalid queue index"
+      root.playFrom(root.queue, index)
+      return "playing queue index " + index
     }
   }
 

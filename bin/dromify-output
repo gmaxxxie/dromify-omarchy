@@ -18,7 +18,7 @@
 #   dromify-output <any dromify-player / dromify-dlna verb> [args...]
 #
 # stdin carries the queue; it is never argv. The payload is one JSON document
-# (url + the song's metadata, so a DLNA backend can build DIDL and decide
+# per track (url + the song's metadata, so a DLNA backend can build DIDL and decide
 # whether the renderer can play the source codec at all), and this script
 # translates it into whatever the selected backend wants — newline-paired
 # url/title records for mpv. Keeping the translation here is what lets the
@@ -36,25 +36,18 @@ OUTPUT_FILE="$STATE_DIR/output"
 
 fail() { echo "dromify-output: $*" >&2; exit 1; }
 
-# The queue arrives on stdin as url/title line pairs — exactly the shape
-# upstream's Service.qml builds, and exactly what dromify-player reads. The
-# DLNA backend wants a richer record (it builds DIDL metadata and has to decide
-# whether the renderer can play the source codec), so the records are stored as
-# one JSON object per line and only flattened for the local backend.
-#
-# Stored as JSON Lines rather than "url\ntitle\n" because a URL or a title
-# containing a newline would desync the pairing; each line is one self-contained
-# JSON value, so there is nothing to desync. Titles are still forced onto a
-# single line on the way in, matching upstream's intent (they are cosmetic).
-queue_to_jsonl() {
+# Service.qml sends JSON Lines with the metadata DLNA needs. Read the declared
+# number of records: Quickshell leaves stdin open after write(), so waiting
+# for EOF would block playback indefinitely.
+read_queue_jsonl() {
   command -v jq >/dev/null 2>&1 || fail "'jq' is required but not found on PATH"
-  local url title line
-  while true; do
-    IFS= read -r url || break
-    IFS= read -r title || fail "queue ended mid-record (url with no title line)"
-    line="$(jq -cn --arg u "$url" --arg t "$title" '{url: $u, title: $t}')" \
-      || fail "could not encode a queue record"
-    printf '%s\n' "$line"
+  local count="$1" line i
+  [[ "$count" =~ ^[0-9]+$ ]] || fail "invalid queue count"
+  for ((i = 0; i < count; i++)); do
+    IFS= read -r line || fail "queue ended before record $((i + 1)) of $count"
+    printf '%s\n' "$line" | jq -ce \
+      'if type == "object" and (.url | type == "string") and (.title | type == "string") then . else error("invalid queue record") end' \
+      || fail "invalid queue record $((i + 1))"
   done
 }
 
@@ -151,6 +144,11 @@ case "${1:-}" in
   load-queue | reorder-tail)
     verb="$1"
     shift
+    if [[ "$verb" == load-queue ]]; then
+      count="${2:-}"
+    else
+      count="${1:-}"
+    fi
     # One temp file holds the records for both backends: the local one wants
     # them flattened, the DLNA one reads the JSON Lines directly. 0600 in the
     # runtime dir, removed on every exit path.
@@ -158,7 +156,7 @@ case "${1:-}" in
       || fail "cannot create a queue file"
     chmod 600 "$records" 2>/dev/null || true
     trap 'rm -f -- "$records" "${records}.pairs"' EXIT
-    queue_to_jsonl >"$records" || exit $?
+    read_queue_jsonl "$count" >"$records" || exit $?
 
     if [[ "$(current_output)" == "dlna" ]]; then
       # The DLNA backend is Python and reads one JSON line per record.

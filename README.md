@@ -70,12 +70,16 @@ SOAP control point, and the optional stream bridge are all in this repo.
 
 ## Install
 
+Install and enable Dromify with one command. Omarchy registers it by the
+plugin ID `tallahootie.dromify` from `manifest.json`:
+
 ```
 omarchy plugin add https://github.com/tallahootie/dromify-omarchy.git --enable
 ```
 
 Pick a bar section when prompted (default: right). Move it later with
 `omarchy bar move tallahootie.dromify --section <left|center|right>`.
+To enable it again later, run `omarchy plugin enable tallahootie.dromify`.
 
 By hand:
 

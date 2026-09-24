@@ -2,21 +2,22 @@
 
 工作分支：`feature/dlna-output`（fork: `gmaxxxie/dromify-omarchy`）
 仓库：`/home/max/project/dromify-omarchy`
-安装位置：`~/.config/omarchy/plugins/tallahootie.dromify`（**注意：两边现在不一致，见「当前状态」**）
+安装位置：`~/.config/omarchy/plugins/tallahootie.dromify`
 
 ---
 
-## 一、待办（明天从这里开始）
+## 一、当前待办与状态
 
 | # | 问题 | 状态 | 现象 | 定位 |
 |---|---|---|---|---|
-| 1 | DLNA 后端 `load-queue` 崩溃 | **已改未验证** | 点歌时报 `NameError: name 'payload' is not defined` | `bin/dromify-dlna:704`，已改为用 `args.start` |
-| 2 | 面板 queue 显示为空、与实际不符 | 待办 | 硬件在播，面板 `queueIndex=-1 / queueLength=0` | 见下方「根因 A」 |
-| 3 | 切歌按钮状态 | 待办 | 按钮已被 `loading` 门控解除，但 `next` 语义仍在改 | 见「根因 B」 |
-| 4 | 事件日志出现 3 次 `loading timeout` | 待办 | 12 秒硬超时被触发 | 说明 `loading` 清除路径仍不可靠，见「根因 C」 |
-| 5 | 待播放列表（queue）UI | **未开始** | 界面看不到待播歌曲 | 需求，见「待做需求」 |
+| 1 | DLNA 后端 `load-queue` 崩溃 | 已修；CLI 实机播放已验证 | `payload` 未定义的问题已改为使用 `args.start` | `bin/dromify-dlna` |
+| 2 | 面板 queue 显示为空、与实际不符 | Service IPC 已验证 | 播放请求立即设置索引，状态轮询再校准 | 见下方「根因 A」 |
+| 3 | 切歌按钮状态 | 后端 `next` 已在 ZR7 实测；UI Service 路径仍待验证 | `next` / `previous` 由后端驱动队列 | 见「根因 B」 |
+| 4 | `loading` 超时 | 已定位并修复，实机播放已验证 | 路由器等待 Quickshell stdin EOF，进程不退出 | 见第十一节 |
+| 5 | 待播放列表（queue）UI | 暂缓 | 当前优先保持上游原版面板，只保留独立 Output 弹窗 | 见「待做需求」及第十节 |
 | 6 | 重启 shell 后渲染器名丢失 | 已修 | `output=dlna` 但名字为空 | `_adoptRenderer()`，见「已完成」 |
-| 7 | 安装目录与仓库不同步 | 待办 | `diff` 有 4 个文件不一致 | 收尾时 `rsync` |
+| 7 | 安装目录与仓库不同步 | 已同步 | 修复文件已安装，shell 已重启 | 见第十一节 |
+| 8 | 列表点选其它歌曲无反应 | 已修，实机连续选曲已验证 | 忙时第二次 `playFrom` 丢弃，却使第一次结果过期 | 见第十二节 |
 
 ---
 
@@ -58,7 +59,7 @@ qs ipc --pid $P call dromifyService playAlbum <albumId>
 
 **已做的修**：用 `_playGen` 代际门控——只有当这次切换期间**没有**新的 `playFrom` 时才清空。`Service.qml:1342` 和 `:1367`。
 
-**还需做**：`playFrom` 成功后应立即把 `queueIndex` 同步给你自己（现在只依赖 `pollNow()` 回来才更新），这样即使 poll 被丢弃，面板也不会显示 `-1`。
+**已做**：`playFrom` 现在立即同步 `queueIndex`，状态轮询随后按后端实际位置校准。仍需在真实面板上验证显示。
 
 ### 根因 B：`next` 委托给设备是错的
 
@@ -79,9 +80,7 @@ qs ipc --pid $P call dromifyService playAlbum <albumId>
 - **删掉了** `if (root.loading) return`（宁可偶尔显示前一拍的位置，也不要面板完全停止更新）
 - 去掉了按钮的 `!nav.loading` 门控
 
-**还需做**：找出为什么 `loading` 会卡满 12 秒。可能原因：
-- `_run(loadProcess, …)` 在 `loadProcess` 忙时静默丢弃 → 回调永不执行（`_run` 返回 false 但 `playFrom` 没处理）
-- **建议**：`playFrom` 里检查 `_run` 的返回值，被丢弃时报错而不是让 `loading` 悬着
+**已做**：`playFrom` 和 `_reorderTail` 检查 `_run` / `_runWithSecret` 的返回值；共享进程忙时记录错误并清除 `loading`。若真实运行中仍出现超时，再用 IPC 事件日志定位具体未退出的子进程。
 
 ### 根因 D：`OutputRow` 曾经是 0 像素宽（已修）
 
@@ -108,9 +107,9 @@ qs ipc --pid $P call dromifyService playAlbum <albumId>
 
 2. **`Panel.qml` 还原成上游 + 只加一个按钮**：`git diff origin/main --numstat` = **210 新增 / 0 删除**。即：面板本身一行都没改，只在头部加了一个「输出」按钮，它打开**独立的输出弹窗**（不是嵌在歌单面板里）。你之前说的「不如不碰原版的，只加个 output 的渠道，要改渠道的再弹窗去选择」——就是这样。
 
-3. **stdin 不再依赖 EOF**：Quickshell 的 `Process` **不会关闭子进程的 stdin**。原来 DLNA 后端用 `json.load(sys.stdin)` → 读完数据干完活，然后永远等一个不会来的 EOF → 进程不退出 → 面板卡在 `loading`。修法：QML 侧写完就 `stdinEnabled = false`；后端只读固定行数。
+3. **stdin 不再依赖 EOF**：此处记录的是上一轮尝试；第十一节的实测证明路由器仍在等待 Quickshell stdin EOF，最终改为按曲目数量读取。
 
-4. **队列格式统一**：`Service.qml` 的 `_queuePayload` 恢复成上游的 url/title 行对；JSON 转换放进 `bin/dromify-output`（router）——和「URL 转换放 router」同一个理由。
+4. **队列格式统一**：此处记录的是上一轮的 url/title 行对；第十一节改为 JSON Lines，以便传递音频格式。
 
 5. **发现渲染器不再卡 45 秒**：
    - 所有网卡同时发 M-SEARCH，用一个 `select` 一起收，轮次并入同一窗口（原来 = 网卡数 × 轮次 × 窗口）
@@ -142,14 +141,13 @@ qs ipc --pid $P call dromifyService clearErrors
 
 ## 五、待做需求
 
-### 5.1 待播放列表（queue）UI
+### 5.1 待播放列表（queue）UI（暂缓）
 
-在输出弹窗里（或另开一个）列出现有队列，标记正在播的那首、可点击跳转。
+当前界面优先保持上游原版布局，不在主面板增加队列列表。后续如重新排期，再评估独立弹窗方案。
 
 - 数据已在 `Service.qml`：`queue` 数组 + `queueIndex`
 - 后端 `dromify-dlna status` 已返回 `playlistPos` / `playlistCount`
-- 点击某一首 = `playFrom(queue, index)`
-- 注意：DLNA 模式下 `queue` 可能为空（根因 A），要先修那个
+- 队列状态修复（根因 A）与 UI 是否展示是两项工作；修复不依赖新增队列界面
 
 ### 5.2 通知栏控制
 
@@ -159,6 +157,42 @@ Omarchy 的 `omarchy.media` 控件（`/usr/share/omarchy/shell/plugins/media`）
 - 依赖已具备：`python-dbus` 是系统已有包
 - 成本：一个独立进程 + 生命周期管理，可能几十到几百行
 - 决定：等 5.1 完成、播放稳定后再做
+
+---
+
+## 十、续记（2026-09-24）
+
+本轮按上述遗留项处理了仓库代码：
+
+- `playFrom` 立即同步 `queueIndex` 的逻辑已在当前分支中；状态轮询继续用后端位置校准它。
+- `_run` / `_runWithSecret` 忙时会记录明确错误并清除 `loading`，避免请求被静默丢弃后只能等看门狗。
+- 保持上游主面板布局；分支已有的独立 Output 弹窗继续提供 *This Computer* 和 DLNA 渲染器选项。本轮没有把输出选择嵌进歌曲浏览面板。
+- 队列列表 UI 暂缓，避免扩大对原版界面的修改。
+
+本轮已同步到 `~/.config/omarchy/plugins/tallahootie.dromify` 并重启 shell。真实运行发现 Output 弹窗原先用错了 `KeyboardPanel` 的 `opened` 属性和信号，已改为 `open` / `onOpenChanged`；最新 shell 日志不再出现 Dromify widget load failure。面板视觉点击未能自动化验证。
+
+ZR7 的缓存设备发现可列出 SRS-ZR7 和 Epson；通过安装版 `dromify-output` 实测了播放、Next、暂停、恢复和停止，状态转换正确。通过 `dromifyService.playAlbum` 的 Service 路径则仍有间歇性 `SetAVTransportURI 501` 和 `loading timeout`，因此端到端 UI 播放尚未通过。测试结束时设备为 `NO_MEDIA_PRESENT`，没有遗留播放。
+
+---
+
+## 十一、播放修复与实机复测（2026-09-24）
+
+- 现场有一个 `dromify-output load-queue 0 1` 运行近 20 分钟，卡在 `anon_pipe_read`，临时文件已写入一条队列记录。原因是路由器继续等待 Quickshell 的 stdin EOF。路由器现按命令给出的曲目数量读取 JSON 记录；`Service.qml` 保持 stdin 可供下次调用复用。
+- 修复阻塞后，单曲请求能退出，但 ZR7 曾短暂进入 `PLAYING` 后变为 `STOPPED`，位置为 0。桥接 URL 的 Range 请求返回 HTTP 206、`audio/mp4`，而 DLNA 队列因缺少曲目 `contentType` 将它声明成 `audio/mpeg`。面板现传递 JSON Lines，包含 `contentType`、后缀和曲目元数据；路由器仍为本地 mpv 转成 URL/title 行对。
+- 假后端回归检查：保持 stdin 打开时，旧路由器超时；新路由器对一首歌正常退出，对不足数量的队列报错。两首歌的 JSON 队列在 DLNA 路径保留 `contentType`，在本地路径转为四行 URL/title。
+- 安装版同步并重启 shell 后，通过 `dromifyService.playAlbum` 两次发起同一首歌。第一次 ZR7 的播放位置增长到 10 秒，第二次重新开始并增长到 3 秒；两次面板均显示 `loading=false`、`playing=true`、`lastError=""`，后端 MIME 为 `audio/mp4`。最终安装版复测再次增长到 3 秒，之后停止了测试播放，后端队列已清空。
+
+实测范围是面板 Service IPC 到音箱状态和播放进度；没有自动化鼠标点击面板。待播放列表 UI 继续暂缓。
+
+---
+
+## 十二、列表点击其它歌曲无反应（2026-09-24）
+
+用户再次点选不同歌曲时，面板事件日志已经收到正确的 `playFrom` 索引，但同一点击后约 150 ms 又出现第二次 `playFrom`。第二次调用先递增 `_playGen`，随后因 `loadProcess` 正忙而被 `_run` 拒绝；第一次的 URL 回调发现代际过期也直接返回，结果两次都不切歌。
+
+`Service.qml` 现在只保留最新的待播放请求，在 `loadProcess` 或 `playQueueProcess` 退出后自动继续；播放加载期间的状态轮询不再用旧曲目覆盖刚点选的索引。新增 `dromifyService.playQueueIndex` 作为诊断入口，可走与歌曲行相同的 `playFrom` 路径。
+
+安装版重启后，在 12 首歌的队列里快速请求索引 6、再请求索引 3。ZR7 最终报告 `PLAYING`、`playlistPos=3`、进度 8 秒；面板报告 `queueIndex=3`、`loading=false`、`lastError=""`，事件日志没有 `playFrom dropped`。本次通过 IPC 模拟连续点选，实际鼠标事件此前已由日志证实到达 `playFrom`。
 
 ---
 
@@ -195,17 +229,18 @@ Sony SRS-ZR7（`192.168.1.27:54380`）：
 
 ---
 
-## 八、当前状态（收尾时确认）
+## 八、上一轮状态（2026-09-24）
 
 ```
-分支        feature/dlna-output（16 个 commit）
-工作树      有未提交改动（Panel.qml / Service.qml / dromify-dlna / dromify-output）
-语法        bash -n / py_compile / qmllint 全部通过
-安装目录    与仓库 **不一致**（4 个文件），明天收尾时 rsync
-隧道        active
+分支        feature/dlna-output
+本轮修改    Panel.qml / Service.qml / docs/dev-log-dlna.md
+检查        bash -n、py_compile、git diff --check 通过；Service.qml 的 qmllint 通过
+面板检查    Quickshell 已加载插件；修复前的 widget load failure 已消失
+后端实测    ZR7 播放 / Next / Pause / Resume / Stop 通过；Service 播放仍有 501 / loading timeout
+安装目录    已 rsync；Panel.qml、Service.qml 与仓库一致
 ```
 
-未提交的改动就是明天要验证的那批（根因 A/B/C 的修）。**先验证再提交**，不要凭「代码看起来对」就 commit。
+这一轮的 Service 播放超时见第十一节；队列 UI 按「尽量保留原版界面」的要求暂缓。**先验证再提交**，不要凭「代码看起来对」就 commit。
 
 ---
 

@@ -670,11 +670,10 @@ def read_queue_tracks() -> list[dict]:
 
     The router (`bin/dromify-output`) stores the queue in the shape upstream's
     Service.qml produces — url/title line pairs — as JSON Lines, one object per
-    record, and hands this backend the records it needs. Each line is
+    record, and hands this backend a regular file. Each line is
     self-contained, so a URL or title containing a newline cannot desync
-    anything, and nothing is ever read to EOF: Quickshell's Process does not
-    close a child's stdin, so an EOF-terminated read would block forever, the
-    process would never exit, and the panel would never see its answer.
+    anything. The router reads the declared count from Quickshell's pipe
+    before invoking this backend, so this file always has an EOF.
     """
     tracks = []
     while True:

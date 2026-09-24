@@ -39,12 +39,18 @@ Service.qml
                                             └── bin/dromify-bridge (optional HTTP range proxy)
 ```
 
-`bin/dromify-output` is a thin router: it forwards its argv/stdin to whichever
-backend the current output selection names, and its stdout is that backend's
-stdout. Service.qml therefore keeps calling the same verbs (`load-queue`,
+`bin/dromify-output` routes commands to the selected backend. For queue
+commands, Service.qml sends one JSON record per track over stdin, including
+the source `contentType`; the router reads the declared track count and
+converts records to URL/title pairs for mpv. It passes the full records to
+DLNA. Service.qml therefore keeps calling the same verbs (`load-queue`,
 `next`, `status`, …) and learns about "which backend" through an `output` field
 in the status JSON. Adding a backend is a new `dromify-output` target and
 nothing else — no renderer-specific code in QML, no new UI framework.
+
+If several song rows are selected while a queue command is running,
+Service.qml retains the latest selection and starts it when the shared
+processes are free. A stale request cannot discard the newer click.
 
 `dromify-dlna` holds the queue in its own state file for the same reason mpv
 holds one: next/previous/auto-advance need a queue, and the panel should not be
