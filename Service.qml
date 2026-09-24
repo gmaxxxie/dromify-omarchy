@@ -1544,14 +1544,25 @@ Item {
   }
 
   // Scans the local /24s for a renderer that does not answer SSDP at all.
-  // Explicitly user-triggered (the panel offers it only after a normal sweep
-  // came back empty) because it opens a connection to every host on the subnet.
+  // Reachable from the output popup at any time, because it is the only way to
+  // find a renderer whose SSDP responder is lossy while some other renderer
+  // keeps the normal sweep's result non-empty — which is the normal case.
+  // Still explicitly user-triggered: it opens a connection to every host on the
+  // subnet, so it must never run from a plain refresh or on panel open.
   function scanForDevices(callback) {
+    if (deviceScanProcess.running) return
     discovering = true
+    outputError = ""
     _run(deviceScanProcess, [outputBin, "devices", "--json", "--scan"], function(data, err) {
       discovering = false
       var devices = (data && data.devices) ? data.devices : []
-      dlnaDevices = devices
+      // Keep the known list when the scan comes back empty, the same way the
+      // sweep does: a scan that found nothing must not blank the picker.
+      if (devices.length) {
+        dlnaDevices = devices
+      } else if (err) {
+        outputError = err
+      }
       if (callback) callback(devices, err || "")
     })
   }

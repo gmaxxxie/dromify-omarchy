@@ -1276,6 +1276,21 @@ Panel {
           onClicked: nav.refreshDevices()
         }
         PanelActionButton {
+          // The refresh above only finds renderers that answer SSDP. A speaker
+          // whose SSDP responder is lossy (measured: a Sony SRS-ZR7 answers
+          // roughly one M-SEARCH in six) stays missing from the list even
+          // though it is on the network and reachable. This is offered as a
+          // standing action rather than only when the list is already empty:
+          // with any always-on renderer present the list is never empty, so an
+          // empty-list-only fallback could never be reached.
+          iconText: "󰐷"
+          tooltipText: "Scan the local network for renderers that did not answer SSDP"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !nav.searchingDevices
+          onClicked: nav.scanForDevices()
+        }
+        PanelActionButton {
           iconText: "󰅖"
           tooltipText: "Close"
           foreground: root.foreground
@@ -1457,7 +1472,7 @@ Panel {
           Layout.fillWidth: true
           Layout.leftMargin: Style.space(8)
           text: nav.searchingDevices ? "Looking for renderers…"
-                                     : "No DLNA renderers found on this network"
+                                     : "No DLNA renderers found — try the network scan"
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
