@@ -1803,6 +1803,16 @@ Item {
         codec: root.audioCodec,
         lastError: root.lastError,
         outputError: root.outputError,
+        volume: root.volume,
+        volumeLoaded: root.volumeLoaded,
+        volumeSupported: root.volumeSupported,
+        volumeAdjustable: root.volumeAdjustable,
+        volumeLoading: root.volumeLoading,
+        volumeOutputSwitchPending: root.volumeOutputSwitchPending,
+        volumeMinimum: root.volumeMinimum,
+        volumeMaximum: root.volumeMaximum,
+        volumeStep: root.volumeStep,
+        volumeError: root.volumeError,
         pollInterval: pollTimer.interval,
         pollRunning: pollTimer.running
       })
@@ -1811,6 +1821,11 @@ Item {
     function devices(): string {
       root.refreshDevices(function(list) {})
       return "sweeping"
+    }
+
+    function readVolume(): string {
+      root.refreshVolume()
+      return "reading output volume"
     }
 
     function showOutput(on: bool): string {

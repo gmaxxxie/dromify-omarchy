@@ -287,7 +287,9 @@ Panel {
           PanelActionButton {
             visible: nav.configured && !nav.showSettings
             iconText: "󰓃"
-            tooltipText: nav.dlnaActive ? ("Output: " + nav.dlnaRenderer) : "Output"
+            tooltipText: nav.dlnaActive
+              ? ("Output & volume: " + nav.dlnaRenderer)
+              : "Output & volume"
             foreground: nav.dlnaActive ? Color.accent : root.foreground
             fontFamily: root.fontFamily
             onClicked: outputPanel.open = !outputPanel.open
@@ -1295,45 +1297,6 @@ Panel {
 
       ColumnLayout {
         Layout.fillWidth: true
-        spacing: Style.space(4)
-
-        OutputRow {
-          Layout.fillWidth: true
-          label: "This Computer"
-          subtitle: "Play through mpv on this machine"
-          selected: !nav.dlnaActive
-          onActivated: nav.selectLocalOutput(function() {})
-        }
-
-        Repeater {
-          model: nav.dlnaDevices
-          delegate: OutputRow {
-            required property var modelData
-            Layout.fillWidth: true
-            label: modelData.name
-            subtitle: [modelData.manufacturer, modelData.model]
-              .filter(function(s) { return s && s !== "" }).join(" · ")
-            selected: nav.dlnaActive && nav.selectedUdn === modelData.udn
-            onActivated: nav.selectDlnaOutput(modelData.udn, function() {})
-          }
-        }
-
-        Text {
-          textFormat: Text.PlainText
-          visible: nav.dlnaDevices.length === 0
-          Layout.fillWidth: true
-          Layout.leftMargin: Style.space(8)
-          text: nav.searchingDevices ? "Looking for renderers…"
-                                     : "No DLNA renderers found on this network"
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
-        }
-      }
-
-      ColumnLayout {
-        Layout.fillWidth: true
         spacing: Style.space(2)
 
         RowLayout {
@@ -1463,6 +1426,45 @@ Panel {
           wrapMode: Text.WordWrap
         }
       }
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(4)
+
+        OutputRow {
+          Layout.fillWidth: true
+          label: "This Computer"
+          subtitle: "Play through mpv on this machine"
+          selected: !nav.dlnaActive
+          onActivated: nav.selectLocalOutput(function() {})
+        }
+
+        Repeater {
+          model: nav.dlnaDevices
+          delegate: OutputRow {
+            required property var modelData
+            Layout.fillWidth: true
+            label: modelData.name
+            subtitle: [modelData.manufacturer, modelData.model]
+              .filter(function(s) { return s && s !== "" }).join(" · ")
+            selected: nav.dlnaActive && nav.selectedUdn === modelData.udn
+            onActivated: nav.selectDlnaOutput(modelData.udn, function() {})
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: nav.dlnaDevices.length === 0
+          Layout.fillWidth: true
+          Layout.leftMargin: Style.space(8)
+          text: nav.searchingDevices ? "Looking for renderers…"
+                                     : "No DLNA renderers found on this network"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+      }
+
 
       Text {
         textFormat: Text.PlainText
