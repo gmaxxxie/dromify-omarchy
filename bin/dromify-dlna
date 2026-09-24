@@ -22,11 +22,13 @@ Verbs
   capabilities                        what the renderer says it can do
   discover-cache                      cached device list, no network
 
-The queue payload on stdin is JSON (never argv: it carries authenticated
-stream URLs):
+The queue arrives on stdin as one JSON record per line (never argv: it carries
+authenticated stream URLs). bin/dromify-output stores the panel's url/title
+pairs as that, adding the fields a renderer needs; the start index stays an
+argument, so this verb reads the same way as dromify-player's:
 
-  {"start": 0, "tracks": [{"id","url","title","artist","album",
-                           "suffix","contentType","duration","size"}, ...]}
+  {"id","url","title","artist","album","suffix","contentType","duration",
+   "size","bitRate"}
 
 Queue ownership mirrors the local backend: this script holds the queue and
 reports an index, Service.qml follows it. mpv owns its queue; a renderer has
@@ -663,47 +665,51 @@ def cmd_configure(args) -> None:
     out({"ok": True, "bridge": state.get("bridge", "auto")})
 
 
-def read_queue_payload() -> dict:
-    """Read the queue JSON from stdin.
+def read_queue_tracks() -> list[dict]:
+    """Read the queue from stdin: one JSON record per line.
 
-    Exactly one line, never to EOF. The panel writes
-    `JSON.stringify(payload) + "\n"`, which is the whole document, and this
-    reads exactly that.
-
-    Deliberately *not* `json.load(sys.stdin)`: Quickshell's Process never
-    closes a child's stdin on its own, so anything that reads to EOF blocks
-    forever. The process would consume the payload, do its work, and then
-    hang — never exiting, so the panel never sees the answer and the track
-    never appears to start. (Service.qml now also sets `stdinEnabled = false`
-    once the payload is written to give the child its EOF; this remains as the
-    belt to that braces, because a helper must not be able to hang on a
-    caller's oversight. dromify-player never hit any of this — it reads a
-    fixed number of lines and so never needed an EOF at all.)
+    The router (`bin/dromify-output`) stores the queue in the shape upstream's
+    Service.qml produces — url/title line pairs — as JSON Lines, one object per
+    record, and hands this backend the records it needs. Each line is
+    self-contained, so a URL or title containing a newline cannot desync
+    anything, and nothing is ever read to EOF: Quickshell's Process does not
+    close a child's stdin, so an EOF-terminated read would block forever, the
+    process would never exit, and the panel would never see its answer.
     """
-    line = sys.stdin.readline()
-    if not line.strip():
-        fail("no queue payload on stdin")
-    try:
-        payload = json.loads(line)
-    except ValueError as exc:
-        fail("queue payload is not JSON: %s" % exc)
-    if not isinstance(payload, dict):
-        fail("queue payload is not a JSON object")
-    return payload
+    tracks = []
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError as exc:
+            fail("queue record is not JSON: %s" % exc)
+        if isinstance(record, dict):
+            tracks.append(record)
+    return tracks
 
 
 def cmd_load_queue(args) -> None:
-    payload = read_queue_payload()
-    tracks = payload.get("tracks") or []
+    tracks = read_queue_tracks()
     if not tracks:
-        fail("queue payload has no tracks")
+        fail("no queue on stdin")
     state = load_state()
     if not state.get("renderer"):
         fail("no renderer selected (run: dromify-dlna select <device>)")
     state["tracks"] = tracks
     state["uris"] = renderer_urls(state, tracks)
     state["ended"] = False
-    index = int(payload.get("start") or 0)
+    # The start index is argv[1] ("start"), not a field of the payload — the
+    # panel passes it as a separate argument because upstream's dromify-player
+    # needs it that way for its own line-pair format.
+    try:
+        index = int(args.start)
+    except (TypeError, ValueError):
+        index = 0
     if not 0 <= index < len(tracks):
         index = 0
     result = start_track(state, index)
@@ -721,10 +727,9 @@ def cmd_reorder_tail(args) -> None:
     restart the stream from zero. Its URIs stay valid because the head of the
     queue is untouched.
     """
-    payload = read_queue_payload()
-    tracks = payload.get("tracks") or []
+    tracks = read_queue_tracks()
     state = load_state()
-    index = int(payload.get("start") or state.get("index") or 0)
+    index = int(state.get("index") or 0)
     if not tracks:
         fail("queue payload has no tracks")
     # Rebuild the tail while keeping the head (history + current) as it was.
@@ -732,6 +737,9 @@ def cmd_reorder_tail(args) -> None:
     old_uris = state.get("uris", [])
     head_tracks = old_tracks[:index + 1]
     head_uris = old_uris[:index + 1]
+    # `tracks` is the *whole* new order; only its tail is new. Taking the tail
+    # from `tracks[index+1:]` is right, and so is keeping the head's existing
+    # (already-resolved) URIs, which is what makes the preload below correct.
     tail = tracks[index + 1:]
     tail_uris = renderer_urls(state, tail)
     state["tracks"] = head_tracks + tail
@@ -763,18 +771,30 @@ def _simple(action: str, fn_name: str) -> None:
 
 
 def cmd_next(args) -> None:
+    """Always driven by this script, never delegated to the renderer.
+
+    Same reasoning as Previous, and measured the same way: the device
+    advertises a Next action and returns success for it, but when it has no
+    preloaded next item — because one was never set, or because it was
+    consumed by the current track — nothing happens. It reports success and
+    goes on playing the same track. Delegating therefore produced a transport
+    button that silently did nothing, with `state.index` never moving, which
+    is exactly what "next does not work" looked like from the panel.
+
+    Moving the queue here also re-establishes the preload for the track after
+    the one being started, so the hand-off chain does not stay broken.
+    """
     state = load_state()
     renderer = renderer_for(state)
     if not renderer:
         fail("no renderer selected")
-    if "Next" in renderer.current_actions():
-        _simple("Next", "next")
-        return
-    # No renderer-side Next: move the queue ourselves.
     index = state.get("index", -1) + 1
     if index >= len(state.get("tracks", [])):
-        out({"ok": False, "error": "end of queue"})
-        return
+        if state.get("repeat") == "all" and state.get("tracks"):
+            index = 0
+        else:
+            out({"ok": False, "error": "end of queue"})
+            return
     out(start_track(state, index))
 
 

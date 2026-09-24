@@ -36,31 +36,39 @@ OUTPUT_FILE="$STATE_DIR/output"
 
 fail() { echo "dromify-output: $*" >&2; exit 1; }
 
-# Reads the queue JSON from stdin (exactly one line — see the note in
-# dromify-dlna's read_queue_payload for why EOF is not usable here) and prints
-# mpv's url/title line pairs.
+# The queue arrives on stdin as url/title line pairs — exactly the shape
+# upstream's Service.qml builds, and exactly what dromify-player reads. The
+# DLNA backend wants a richer record (it builds DIDL metadata and has to decide
+# whether the renderer can play the source codec), so the records are stored as
+# one JSON object per line and only flattened for the local backend.
 #
-# The child is pointed at a *fresh* descriptor carrying those pairs rather than
-# at this script's stdin. Two reasons: the payload has already been consumed
-# here, so there is nothing left on stdin for it; and a helper that inherited
-# this stdin would block on a pipe the panel never closes.
-queue_json_to_pairs() {
+# Stored as JSON Lines rather than "url\ntitle\n" because a URL or a title
+# containing a newline would desync the pairing; each line is one self-contained
+# JSON value, so there is nothing to desync. Titles are still forced onto a
+# single line on the way in, matching upstream's intent (they are cosmetic).
+queue_to_jsonl() {
   command -v jq >/dev/null 2>&1 || fail "'jq' is required but not found on PATH"
-  local payload
-  # `|| true` on purpose: `read` returns non-zero at EOF *and* hands back what
-  # it read, so a payload with no trailing newline is still usable. Requiring
-  # the newline would make this fail on a caller that writes the JSON and
-  # closes — a shell `printf '%s' "$json" |`, for instance.
-  IFS= read -r payload || true
-  [[ -n "$payload" ]] || fail "no queue payload on stdin"
-  printf '%s' "$payload" | jq -jr '
-    if (.tracks | type) != "array" then error("queue payload has no tracks array")
-    else
-      .tracks[]
-      | ((.url // "") | gsub("[\r\n]"; " ")), "\n",
-        ((.title // "") | gsub("[\r\n]"; " ")), "\n"
-    end
-  '
+  local url title line
+  while true; do
+    IFS= read -r url || break
+    IFS= read -r title || fail "queue ended mid-record (url with no title line)"
+    line="$(jq -cn --arg u "$url" --arg t "$title" '{url: $u, title: $t}')" \
+      || fail "could not encode a queue record"
+    printf '%s\n' "$line"
+  done
+}
+
+# The same records, flattened back into the url/title pairs dromify-player
+# reads. Written to a file rather than piped: under a closed-pipe stdin bash can
+# reorder the redirections, and the child must not inherit a stdin that is still
+# waiting on the caller.
+jsonl_to_pairs() {
+  local src="$1" dst="$2"
+  # One url line, then its title line, for every record. A missing trailing
+  # newline is fine: dromify-player reads the pairs from a file and its last
+  # read returns what it read.
+  jq -jr '.url, "\n", .title, "\n"' "$src" >"$dst" || return 1
+  return 0
 }
 
 current_output() {
@@ -143,26 +151,31 @@ case "${1:-}" in
   load-queue | reorder-tail)
     verb="$1"
     shift
-    if [[ "$(current_output)" == "dlna" ]]; then
-      exec python3 "$DLNA" "$verb" "$@"
-    fi
-    # The count argument is preserved: dromify-player validates it against the
-    # payload it is about to read, which is exactly the check worth keeping.
-    #
-    # The records go to a temp file rather than through a pipe or process
-    # substitution. Both of those work in an interactive shell but not
-    # reliably here: under `subprocess.run(stdin=PIPE)` the shell's fd 0 is a
-    # closed pipe, and bash can reorder the redirections in a way that leaves
-    # the helper with the wrong stdin. A file has no such ambiguity, and it is
-    # 0600 in a 0700 directory and unlinked immediately.
+    # One temp file holds the records for both backends: the local one wants
+    # them flattened, the DLNA one reads the JSON Lines directly. 0600 in the
+    # runtime dir, removed on every exit path.
     records="$(mktemp -p "${XDG_RUNTIME_DIR:-/tmp}" dromify-queue.XXXXXX)" \
       || fail "cannot create a queue file"
     chmod 600 "$records" 2>/dev/null || true
-    trap 'rm -f -- "$records"' EXIT
-    queue_json_to_pairs >"$records" || exit $?
-    "$PLAYER" "$verb" "$@" <"$records"
+    trap 'rm -f -- "$records" "${records}.pairs"' EXIT
+    queue_to_jsonl >"$records" || exit $?
+
+    if [[ "$(current_output)" == "dlna" ]]; then
+      # The DLNA backend is Python and reads one JSON line per record.
+      python3 "$DLNA" "$verb" "$@" <"$records"
+      status=$?
+      rm -f -- "$records"
+      trap - EXIT
+      exit "$status"
+    fi
+
+    if [[ ! -s "$records" ]]; then
+      fail "no queue on stdin"
+    fi
+    jsonl_to_pairs "$records" "${records}.pairs" || fail "could not build the queue"
+    "$PLAYER" "$verb" "$@" <"${records}.pairs"
     status=$?
-    rm -f -- "$records"
+    rm -f -- "$records" "${records}.pairs"
     trap - EXIT
     exit "$status"
     ;;

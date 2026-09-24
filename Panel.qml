@@ -281,6 +281,18 @@ Panel {
             }
           }
 
+          // The only addition to the upstream panel: where the audio comes
+          // out. It opens a popup of its own (below) rather than growing the
+          // library panel, so the browsing UI above stays exactly as it was.
+          PanelActionButton {
+            visible: nav.configured && !nav.showSettings
+            iconText: "󰓃"
+            tooltipText: nav.dlnaActive ? ("Output: " + nav.dlnaRenderer) : "Output"
+            foreground: nav.dlnaActive ? Color.accent : root.foreground
+            fontFamily: root.fontFamily
+            onClicked: outputPanel.opened = !outputPanel.opened
+          }
+
           PanelActionButton {
             iconText: nav.showSettings ? "󰁍" : "󰒓"
             tooltipText: nav.showSettings ? "Back to library" : "Server settings"
@@ -1215,6 +1227,204 @@ Panel {
           foreground: (npBar.song && npBar.song.starred) ? Color.accent : root.foreground
           fontFamily: root.fontFamily
           onClicked: nav.toggleFavorite(npBar.song)
+        }
+      }
+    }
+  }
+
+  // --- output / cast popup -----------------------------------------------------
+  // Deliberately a separate KeyboardPanel hanging off the same bar button, not
+  // a section inside the library panel. Selecting a renderer is a rare,
+  // self-contained decision; giving it its own popup keeps the library panel
+  // byte-identical to upstream's and means the two can never fight over
+  // height, scrolling or keyboard focus.
+  KeyboardPanel {
+    id: outputPanel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: false
+    contentWidth: fittedContentWidth(Style.space(380))
+    contentHeight: fittedContentHeight(outputColumn.implicitHeight, Style.space(560))
+
+    ColumnLayout {
+      id: outputColumn
+      width: parent.width
+      spacing: Style.space(10)
+
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(6)
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Output"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+        Item { Layout.fillWidth: true }
+        PanelActionButton {
+          iconText: "󰑐"
+          tooltipText: "Refresh devices"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !nav.searchingDevices
+          onClicked: nav.refreshDevices()
+        }
+        PanelActionButton {
+          iconText: "󰅖"
+          tooltipText: "Close"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: outputPanel.opened = false
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        wrapMode: Text.WordWrap
+        visible: nav.outputError !== ""
+        text: nav.outputError
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(4)
+
+        OutputRow {
+          Layout.fillWidth: true
+          label: "This Computer"
+          subtitle: "Play through mpv on this machine"
+          selected: !nav.dlnaActive
+          onActivated: nav.selectLocalOutput(function() {})
+        }
+
+        Repeater {
+          model: nav.dlnaDevices
+          delegate: OutputRow {
+            required property var modelData
+            Layout.fillWidth: true
+            label: modelData.name
+            subtitle: [modelData.manufacturer, modelData.model]
+              .filter(function(s) { return s && s !== "" }).join(" · ")
+            selected: nav.dlnaActive && nav.selectedUdn === modelData.udn
+            onActivated: nav.selectDlnaOutput(modelData.udn, function() {})
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: nav.dlnaDevices.length === 0
+          Layout.fillWidth: true
+          Layout.leftMargin: Style.space(8)
+          text: nav.searchingDevices ? "Looking for renderers…"
+                                     : "No DLNA renderers found on this network"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: nav.dlnaActive
+        Layout.fillWidth: true
+        text: "Streaming to " + nav.dlnaRenderer + " — the speaker fetches the audio itself"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+
+    // Refresh on open: renderers come and go, and the list is cheap from cache
+    // with the sweep running behind it.
+    onOpenedChanged: if (opened) nav.refreshDevices()
+  }
+
+  component OutputRow: CursorSurface {
+    id: outputRow
+    property string label: ""
+    property string subtitle: ""
+    property bool selected: false
+    property var modelData: null
+    signal activated()
+
+    foreground: root.foreground
+    implicitWidth: rowContent.implicitWidth
+    implicitHeight: rowContent.implicitHeight + Style.space(10)
+    color: outputRow.selected ? fill : (rowArea.containsMouse ? fill : "transparent")
+    borderSpec: outputRow.selected
+      ? Border.controlSpec("focus", root.foreground, Color.accent)
+      : Border.none()
+
+    MouseArea {
+      id: rowArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: outputRow.activated()
+    }
+
+    RowLayout {
+      id: rowContent
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(8)
+      anchors.rightMargin: Style.space(8)
+      spacing: Style.space(8)
+
+      Rectangle {
+        Layout.alignment: Qt.AlignVCenter
+        width: Style.space(10)
+        height: Style.space(10)
+        radius: width / 2
+        color: "transparent"
+        border.width: 1
+        border.color: outputRow.selected ? Color.accent : root.dim
+        Rectangle {
+          anchors.centerIn: parent
+          visible: outputRow.selected
+          width: parent.width - Style.space(4)
+          height: parent.height - Style.space(4)
+          radius: width / 2
+          color: Color.accent
+        }
+      }
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        spacing: Style.space(1)
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          Layout.minimumWidth: 0
+          text: outputRow.label
+          color: outputRow.selected ? Color.accent : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: outputRow.selected
+          elide: Text.ElideRight
+        }
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          Layout.minimumWidth: 0
+          visible: outputRow.subtitle !== ""
+          text: outputRow.subtitle
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
         }
       }
     }

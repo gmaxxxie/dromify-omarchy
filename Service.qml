@@ -626,30 +626,19 @@ Item {
   // carry the Subsonic salt+token, so they go over stdin, never argv (see
   // _runWithSecret). Titles are forced onto a single line — they're only a
   // cosmetic force-media-title, and a newline would desync the pairing.
-  function _queuePayload(songs, urls, startIndex) {
-    // One JSON document, not newline-paired fields: the local backend only
-    // needs url + a display title, but a DLNA backend also has to build DIDL
-    // metadata and decide whether the renderer can play the source codec at
-    // all — so it needs the whole song record. `title` stays
-    // Model.nowPlayingLabel's short form (mpv bakes it into the playlist
-    // entry; the renderer shows it in its own display).
-    var tracks = []
+  // Builds the stdin payload for dromify-player load-queue / reorder-tail:
+  // url and title on their own lines, one pair per track. The stream URLs
+  // carry the Subsonic salt+token, so they go over stdin, never argv (see
+  // _runWithSecret). Titles are forced onto a single line — they're only a
+  // cosmetic force-media-title, and a newline would desync the pairing.
+  function _queuePayload(songs, urls) {
+    var lines = []
     for (var i = 0; i < urls.length; i++) {
-      var song = songs[i] || {}
-      tracks.push({
-        id: String(song.id || ""),
-        url: urls[i],
-        title: String(Model.nowPlayingLabel(song)).replace(/[\r\n]+/g, " "),
-        artist: String(song.artist || ""),
-        album: String(song.album || ""),
-        suffix: String(song.suffix || ""),
-        contentType: String(song.contentType || ""),
-        duration: Number(song.duration) || 0,
-        size: Number(song.size) || 0,
-        bitRate: Number(song.bitRate) || 0
-      })
+      var title = songs[i] ? Model.nowPlayingLabel(songs[i]) : ""
+      lines.push(urls[i])
+      lines.push(String(title).replace(/[\r\n]+/g, " "))
     }
-    return JSON.stringify({ start: Number(startIndex) || 0, tracks: tracks })
+    return lines.join("\n")
   }
 
   // Plays `songs[startIndex]`, queuing the rest of `songs` behind it as the
@@ -675,7 +664,7 @@ Item {
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
       _runWithSecret(playQueueProcess,
                      [outputBin, "load-queue", String(startIndex), String(urls.length)],
-                     _queuePayload(songs, urls, startIndex),
+                     _queuePayload(songs, urls),
                      function(data, err) {
         if (gen !== _playGen) return
         loading = false
@@ -786,7 +775,7 @@ Item {
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
       _runWithSecret(playQueueProcess,
                      [outputBin, "reorder-tail", String(urls.length)],
-                     _queuePayload(newQueue, urls, newIndex),
+                     _queuePayload(newQueue, urls),
                      function() {
         if (gen !== _playGen) return
         loading = false
@@ -816,6 +805,24 @@ Item {
     duration = 0
     _run(playerCtlProcess, [outputBin, "stop"], function() {})
   }
+
+  // A stuck `loading` is not a cosmetic problem: it disables next/previous and
+  // causes every status poll to be discarded, so the panel goes both
+  // unresponsive and stale at once. It can stick for several mundane reasons
+  // (a call dropped because the shared Process was busy, a generation change
+  // mid-flight, an exit that never arrives), so it gets a deadline.
+  Timer {
+    id: loadingWatchdog
+    interval: 12000
+    repeat: false
+    onTriggered: {
+      if (root.loading) {
+        root.logEvent("loading timeout", "cleared after 12s")
+        root.loading = false
+      }
+    }
+  }
+  onLoadingChanged: if (loading) loadingWatchdog.restart(); else loadingWatchdog.stop()
 
   function pollNow() {
     if (!dlnaActive && queueIndex < 0) return
@@ -879,7 +886,6 @@ Item {
       // has processed those commands. Skip the whole update rather than
       // just the queueIndex sync: position/duration for the old track
       // would be just as misleading to show for that one tick.
-      if (root.loading) return
       var data = null
       try { data = JSON.parse(pollOut.text) } catch (e) { return }
       if (!data) return
@@ -1204,9 +1210,10 @@ Item {
   // never on a timer: each sweep is a burst of SSDP probes and a handful of
   // HTTP fetches, which is not something to do in the background.
 
-  // Which renderer the user last clicked, for the radio button's highlight
-  // while the selection round-trips through the backend.
-  property string selectedDevice: ""
+  // The UDN of the renderer the user chose. `dlnaRenderer` holds its display
+  // name; this holds the identity, so the picker's highlight survives a
+  // rename and does not depend on two devices not sharing a name.
+  property string selectedUdn: ""
 
   readonly property bool supportsPause: dlnaCapabilities.length === 0 || dlnaCapabilities.indexOf("Pause") >= 0
   readonly property bool supportsSeek: dlnaCapabilities.length === 0 || dlnaCapabilities.indexOf("Seek") >= 0
@@ -1305,19 +1312,24 @@ Item {
   }
 
   function selectLocalOutput(callback) {
+    var gen = _playGen
     var queued = _run(outputProcess, [outputBin, "output", "local"], function(data, err) {
       logEvent("selectLocalOutput done", err || (data ? String(data.output) : "no data"))
       output = "local"
       dlnaCapabilities = []
       dlnaState = ""
       dlnaRenderer = ""
-      selectedDevice = ""
+      selectedUdn = ""
       outputError = ""
       // A track playing on the renderer is not playing here, and the local
       // queue is whatever mpv still has — which is nothing once the output
       // switch has stopped it. Ask for a fresh snapshot rather than carrying
       // the renderer's position over.
-      clearPlaybackState()
+      //
+      // Only if nothing was started while this switch was in flight: the
+      // switch is as slow as the shared output process is busy, and a track
+      // queued in the meantime is newer news than the switch itself.
+      if (gen === _playGen) clearPlaybackState()
       _warmUpPlayer()
       if (callback) callback(!err, err || "")
     })
@@ -1325,7 +1337,8 @@ Item {
   }
 
   function selectDlnaOutput(selector, callback) {
-    selectedDevice = String(selector)
+    selectedUdn = String(selector)
+    var gen = _playGen
     var queued = _run(outputProcess, [outputBin, "output", "dlna", String(selector)], function(data, err) {
       logEvent("selectDlnaOutput done", (err || (data && data.renderer ? data.renderer.name : "no data")))
       if (err || !data || !data.renderer) {
@@ -1339,8 +1352,9 @@ Item {
       dlnaState = ""
       outputError = ""
       // The queue belongs to the backend, and the backend was just switched:
-      // nothing is playing until a track is chosen.
-      clearPlaybackState()
+      // nothing is playing until a track is chosen. See the note in
+      // selectLocalOutput for why this is generation-gated.
+      if (gen === _playGen) clearPlaybackState()
       pollTimer.restart()
       if (callback) callback(true, "")
     })
@@ -1455,7 +1469,18 @@ Item {
   // machine, inspecting that state from outside is otherwise impossible, and
   // several real bugs were invisible from the command line while being obvious
   // in here.
+  // Only the plugin's real instance serves IPC. Panel.qml creates a fallback
+  // Service (`_localNav`) so its bindings have a non-null target during a
+  // plugin reload — but that instance is not the one the panel talks to, and
+  // two Service instances registering the same target means Quickshell keeps
+  // one and warns about the other. Whichever it kept, commands could land on
+  // the instance nobody drives, which looks exactly like "the button did
+  // nothing". `exposeIpc` is true only for the instance Quickshell creates
+  // from the manifest; the panel's fallback leaves it false.
+  property bool exposeIpc: true
+
   IpcHandler {
+    enabled: root.exposeIpc
     target: "dromifyService"
 
     function events(): string { return root.events() }
@@ -1498,6 +1523,11 @@ Item {
     function devices(): string {
       root.refreshDevices(function(list) {})
       return "sweeping"
+    }
+
+    function showOutput(on: bool): string {
+      root.showOutput = on
+      return "showOutput=" + on
     }
 
     function select(udn: string): string {
