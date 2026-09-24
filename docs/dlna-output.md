@@ -125,6 +125,15 @@ Polling is adaptive (playing 1 s, paused 3 s, stopped/idle 8 s) rather than a
 fixed 800 ms, because every poll is two SOAP round-trips to the device. mpv
 keeps its 800 ms locally.
 
+Volume is read separately when the Output popup opens and after a volume write;
+it is not added to the transport poll. RenderingControl's volume range is
+vendor-defined, so the backend reads the `GetVolume` state variable's range and
+step from the service description. The UI aligns writes to that step. If the
+maximum is absent, it shows the renderer-native value with relative step buttons
+instead of treating it as a percentage. A renderer without `GetVolume` support
+disables the control; one without `SetVolume` reports its current value as
+read-only.
+
 Capabilities are *read from the device* (`GetCurrentTransportActions`), never
 assumed:
 

@@ -70,6 +70,32 @@ Item {
   property real position: 0
   property real duration: 0
   property int volume: 100
+  property int volumeMinimum: 0
+  property int volumeMaximum: 100
+  property int volumeStep: 1
+  property bool volumeSupported: true
+  property bool volumeAdjustable: true
+  property bool volumeLoaded: false
+  property bool volumeLoading: false
+  property bool volumeWritePending: false
+  property string volumeError: ""
+  readonly property bool volumeRangeKnown: volumeMaximum >= volumeMinimum
+  readonly property int volumeEffectiveMaximum: volumeRangeKnown
+      ? volumeMinimum + Math.floor((volumeMaximum - volumeMinimum) / Math.max(1, volumeStep)) * Math.max(1, volumeStep)
+      : volumeMaximum
+  readonly property bool volumeRangeAdjustable: volumeRangeKnown && volumeEffectiveMaximum > volumeMinimum
+  readonly property int volumePercent: volumeRangeAdjustable
+      ? Math.round(100 * (volume - volumeMinimum) / (volumeEffectiveMaximum - volumeMinimum))
+      : 0
+  property int _volumeGeneration: 0
+  property int _volumeRevision: 0
+  property int _outputRevision: 0
+  property int _confirmedVolume: 100
+  property int _pendingVolume: -1
+  property bool _volumeReadPending: false
+  property var _pendingOutputSwitch: null
+  property bool _outputSwitchInFlight: false
+  readonly property bool volumeOutputSwitchPending: _outputSwitchInFlight || _pendingOutputSwitch !== null
   // What's actually being decoded right now — from mpv, not the source
   // file's own tags, so it reflects any server-side transcoding rather
   // than just what the original file happens to be.
@@ -802,8 +828,121 @@ Item {
   }
 
   function setVolume(v) {
-    volume = v
-    _run(playerCtlProcess, [outputBin, "volume", String(Math.round(v))], function() {})
+    if (!volumeLoaded || !volumeSupported || !volumeAdjustable || volumeOutputSwitchPending) return
+    var max = volumeRangeKnown ? volumeEffectiveMaximum : 65535
+    var step = Math.max(1, volumeStep)
+    var maxSteps = Math.max(0, Math.floor((max - volumeMinimum) / step))
+    var requested = Math.max(volumeMinimum, Math.min(max, Math.round(Number(v) || 0)))
+    var steps = Math.max(0, Math.min(maxSteps,
+        Math.round((requested - volumeMinimum) / step)))
+    var next = volumeMinimum + steps * step
+    _volumeRevision++
+    volume = next
+    _pendingVolume = next
+    volumeWritePending = true
+    volumeError = ""
+    _drainVolumeRequests()
+  }
+
+  function setVolumePercent(percent) {
+    if (!volumeRangeKnown || volumeEffectiveMaximum <= volumeMinimum) return
+    var p = Math.max(0, Math.min(100, Number(percent) || 0))
+    setVolume(volumeMinimum + Math.round((volumeEffectiveMaximum - volumeMinimum) * p / 100))
+  }
+
+  function refreshVolume() {
+    if (volumeOutputSwitchPending) return
+    volumeError = ""
+    volumeLoading = true
+    if (volumeProcess.running && volumeProcess._kind === "get"
+            && volumeProcess._generation === _volumeGeneration
+            && _pendingVolume < 0) return
+    _volumeReadPending = true
+    _drainVolumeRequests()
+  }
+
+  function _resetVolumeForOutput() {
+    _volumeGeneration++
+    _volumeRevision++
+    _pendingVolume = -1
+    _volumeReadPending = false
+    volumeWritePending = false
+    volumeLoading = false
+    volumeLoaded = false
+    volumeSupported = !dlnaActive
+    volumeAdjustable = true
+    volumeMinimum = 0
+    volumeMaximum = dlnaActive ? -1 : 100
+    volumeStep = 1
+    _confirmedVolume = 100
+    volumeError = ""
+  }
+
+  function _startVolumeRequest(kind, command) {
+    volumeProcess._kind = kind
+    volumeProcess._generation = _volumeGeneration
+    volumeProcess._revision = _volumeRevision
+    volumeProcess.command = command
+    volumeProcess.running = true
+  }
+
+  function _drainVolumeRequests() {
+    if (volumeOutputSwitchPending) {
+      if (!volumeProcess.running) _drainPendingOutputSwitch()
+      return
+    }
+    // `refreshOutput()` shares outputProcess with actual switches. Do not
+    // sample or change the backend while that process is still resolving the
+    // currently selected output.
+    if (volumeProcess.running || outputProcess.running) return
+    if (_pendingVolume >= 0) {
+      var next = _pendingVolume
+      _pendingVolume = -1
+      _startVolumeRequest("set", [outputBin, "volume", String(next)])
+      return
+    }
+    if (_volumeReadPending) {
+      _volumeReadPending = false
+      _startVolumeRequest("get", [outputBin, "get-volume"])
+      return
+    }
+    volumeWritePending = false
+  }
+
+  function _requestOutputSwitch(kind, selector, callback) {
+    var previous = _pendingOutputSwitch
+    _pendingOutputSwitch = { kind: kind, selector: selector, callback: callback }
+    _volumeGeneration++
+    _volumeRevision++
+    _outputRevision++
+    _pendingVolume = -1
+    _volumeReadPending = false
+    volumeLoaded = false
+    volumeLoading = true
+    volumeWritePending = volumeProcess.running || outputProcess.running
+    volumeError = ""
+    if (previous && previous.callback) previous.callback(false, "superseded by a newer output switch")
+    _drainPendingOutputSwitch()
+  }
+
+  function _drainPendingOutputSwitch() {
+    if (!volumeOutputSwitchPending || volumeProcess.running || outputProcess.running) return
+    var request = _pendingOutputSwitch
+    _pendingOutputSwitch = null
+    _outputSwitchInFlight = true
+    if (request.kind === "local") _selectLocalOutput(request.callback)
+    else _selectDlnaOutput(request.selector, request.callback)
+  }
+
+  function _finishOutputSwitchFailure(callback, error) {
+    _outputSwitchInFlight = false
+    outputError = error || "could not switch output"
+    if (!volumeOutputSwitchPending) {
+      _resetVolumeForOutput()
+      refreshVolume()
+    }
+    if (callback) callback(false, error)
+    Qt.callLater(_drainPendingOutputSwitch)
   }
 
   function stopPlayback() {
@@ -836,6 +975,7 @@ Item {
   onLoadingChanged: if (loading) loadingWatchdog.restart(); else loadingWatchdog.stop()
 
   function pollNow() {
+    if (volumeOutputSwitchPending) return
     if (!dlnaActive && queueIndex < 0) return
     if (statusPollProcess.running) return
     // Tags this poll with the play generation active right now, so if a
@@ -843,6 +983,8 @@ Item {
     // the (by then stale) result gets discarded instead of applied — see the
     // onExited handler below for why that matters.
     statusPollProcess._gen = _playGen
+    statusPollProcess._volumeRevision = _volumeRevision
+    statusPollProcess._outputRevision = _outputRevision
     statusPollProcess.command = [outputBin, "status"]
     statusPollProcess.running = true
   }
@@ -861,7 +1003,11 @@ Item {
 
   // Re-evaluates the cadence whenever the transport state changes.
   onDlnaStateChanged: root._syncPollInterval()
-  onOutputChanged: root._syncPollInterval()
+  onOutputChanged: {
+    root._syncPollInterval()
+    root._resetVolumeForOutput()
+    root.refreshVolume()
+  }
 
   function _syncPollInterval() {
     if (!dlnaActive) {
@@ -876,6 +1022,8 @@ Item {
   Process {
     id: statusPollProcess
     property int _gen: 0
+    property int _volumeRevision: 0
+    property int _outputRevision: 0
     running: false
     stdout: StdioCollector { id: pollOut; waitForEnd: true }
     onExited: function(exitCode) {
@@ -888,6 +1036,9 @@ Item {
       // response from a request that was already in flight when the click
       // happened, landing after the optimistic queue/queueIndex update.
       if (statusPollProcess._gen !== root._playGen) return
+      // A status request from the previous backend must not land after an
+      // output selection and make the panel follow the stale mode again.
+      if (statusPollProcess._outputRevision !== root._outputRevision) return
       // Narrower version of the same problem: a poll dispatched *after* the
       // generation bump can still reach mpv before load-queue's own IPC
       // commands do (there's no ordering guarantee between two independent
@@ -905,7 +1056,18 @@ Item {
       root.playing = data.running === true && data.paused !== true
       root.position = Number(data.position) || 0
       root.duration = Number(data.duration) || 0
-      if (data.volume !== undefined) root.volume = Math.round(Number(data.volume))
+      if (!root.volumeOutputSwitchPending && data.output !== "dlna" && typeof data.volume === "number"
+              && statusPollProcess._volumeRevision === root._volumeRevision
+              && !root.volumeWritePending) {
+        root.volume = Math.max(0, Math.min(100, Math.round(data.volume)))
+        root._confirmedVolume = root.volume
+        root.volumeMinimum = 0
+        root.volumeMaximum = 100
+        root.volumeStep = 1
+        root.volumeSupported = true
+        root.volumeAdjustable = true
+        root.volumeLoaded = true
+      }
       root.audioCodec = data.audioCodec || ""
       root.audioBitrate = Number(data.audioBitrate) || 0
 
@@ -1154,8 +1316,97 @@ Item {
     }
   }
 
+  // Volume traffic has its own serialized process. DLNA SOAP calls can take
+  // longer than a local mpv command; keep only the newest pending slider
+  // value and read the confirmed value after the last write completes.
+  Process {
+    id: volumeProcess
+    property string _kind: ""
+    property int _generation: 0
+    property int _revision: 0
+    running: false
+    stdout: StdioCollector { id: volumeOut; waitForEnd: true }
+    stderr: StdioCollector { id: volumeErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var kind = volumeProcess._kind
+      var generation = volumeProcess._generation
+      var revision = volumeProcess._revision
+      volumeProcess._kind = ""
+
+      var data = null
+      try { data = JSON.parse(volumeOut.text) } catch (e) {}
+      if (generation === root._volumeGeneration) {
+        if (kind === "get") {
+          root.volumeLoading = false
+          if (exitCode === 0 && data && data.ok === true && data.supported === false) {
+            root.volumeLoaded = true
+            root.volumeSupported = false
+            root.volumeAdjustable = false
+            root.volumeMaximum = -1
+            root.volumeWritePending = root._pendingVolume >= 0
+          } else if (exitCode === 0 && data && data.ok === true
+                     && data.supported === true && typeof data.volume === "number") {
+            var minimum = typeof data.minimum === "number" ? Math.round(data.minimum) : 0
+            var maximum = typeof data.maximum === "number" ? Math.round(data.maximum) : -1
+            var step = typeof data.step === "number" ? Math.round(data.step) : 1
+            root.volumeMinimum = Math.max(0, minimum)
+            root.volumeMaximum = maximum >= root.volumeMinimum ? maximum : -1
+            root.volumeStep = Math.max(1, step)
+            root.volumeSupported = true
+            root.volumeAdjustable = data.adjustable !== false
+            root.volumeLoaded = true
+            if (revision === root._volumeRevision && root._pendingVolume < 0) {
+              var upper = root.volumeRangeKnown ? root.volumeEffectiveMaximum : 65535
+              root.volume = Math.max(root.volumeMinimum,
+                                     Math.min(upper, Math.round(data.volume)))
+              root._confirmedVolume = root.volume
+            }
+            root.volumeWritePending = root._pendingVolume >= 0
+          } else {
+            var readError = data && data.error ? data.error : volumeErr.text
+            root.volumeError = String(readError || "could not read output volume")
+              .replace(/^dromify-(output|dlna|player):\s*/, "").trim()
+            root.volumeWritePending = root._pendingVolume >= 0
+          }
+        } else if (kind === "set") {
+          var latest = revision === root._volumeRevision && root._pendingVolume < 0
+          if (exitCode !== 0 || !data || data.ok !== true) {
+            if (latest && data && data.supported === false) {
+              root.volumeSupported = false
+              root.volumeAdjustable = false
+              root.volumeLoaded = true
+              root.volumeMaximum = -1
+            }
+            if (latest) {
+              root.volume = root._confirmedVolume
+              var writeError = data && data.error ? data.error : volumeErr.text
+              root.volumeError = String(writeError || "could not set output volume")
+                .replace(/^dromify-(output|dlna|player):\s*/, "").trim()
+            }
+          } else if (latest) {
+            if (typeof data.volume === "number") {
+              root._confirmedVolume = Math.round(data.volume)
+            } else {
+              root._confirmedVolume = root.volume
+            }
+            root.volumeError = ""
+          }
+
+          if (root._pendingVolume >= 0) {
+            root.volumeWritePending = true
+          } else {
+            root.volumeWritePending = true
+            root.volumeLoading = true
+            root._volumeReadPending = true
+          }
+        }
+      }
+      Qt.callLater(root._drainVolumeRequests)
+    }
+  }
+
   // Separate from playerCtlProcess so a track load never contends with an
-  // unrelated transport call (pause/seek/volume/next/previous) sharing the
+  // unrelated transport call (pause/seek/next/previous) sharing the
   // same Process object and getting silently dropped by _run's busy guard.
   // Always driven via _runWithSecret: the queue's stream URLs (which carry
   // the Subsonic token) are written to stdin from onStarted, never argv.
@@ -1318,9 +1569,19 @@ Item {
   }
 
   function selectLocalOutput(callback) {
+    _requestOutputSwitch("local", "", callback)
+  }
+
+  function _selectLocalOutput(callback) {
     var gen = _playGen
+    var volumeGen = _volumeGeneration
     var queued = _run(outputProcess, [outputBin, "output", "local"], function(data, err) {
       logEvent("selectLocalOutput done", err || (data ? String(data.output) : "no data"))
+      if (err || !data || data.output !== "local") {
+        _finishOutputSwitchFailure(callback, err || "could not select local output")
+        return
+      }
+      _outputSwitchInFlight = false
       output = "local"
       dlnaCapabilities = []
       dlnaState = ""
@@ -1337,22 +1598,33 @@ Item {
       // queued in the meantime is newer news than the switch itself.
       if (gen === _playGen) clearPlaybackState()
       _warmUpPlayer()
+      if (root._volumeGeneration === volumeGen) {
+        root._resetVolumeForOutput()
+        root.refreshVolume()
+      }
       if (callback) callback(!err, err || "")
+      Qt.callLater(_drainPendingOutputSwitch)
     })
-    logEvent("selectLocalOutput", queued ? "" : "(DROPPED: output process busy)")
+    if (!queued) _finishOutputSwitchFailure(callback, "output process is busy")
+    logEvent("selectLocalOutput", queued ? "" : "(could not start: output process busy)")
   }
 
   function selectDlnaOutput(selector, callback) {
-    selectedUdn = String(selector)
+    _requestOutputSwitch("dlna", String(selector), callback)
+  }
+
+  function _selectDlnaOutput(selector, callback) {
     var gen = _playGen
+    var volumeGen = _volumeGeneration
     var queued = _run(outputProcess, [outputBin, "output", "dlna", String(selector)], function(data, err) {
       logEvent("selectDlnaOutput done", (err || (data && data.renderer ? data.renderer.name : "no data")))
       if (err || !data || !data.renderer) {
-        outputError = err || "could not select that renderer"
-        if (callback) callback(false, outputError)
+        _finishOutputSwitchFailure(callback, err || "could not select that renderer")
         return
       }
+      _outputSwitchInFlight = false
       output = "dlna"
+      selectedUdn = String(selector)
       dlnaRenderer = data.renderer.name || ""
       dlnaCapabilities = data.capabilities || []
       dlnaState = ""
@@ -1362,9 +1634,15 @@ Item {
       // selectLocalOutput for why this is generation-gated.
       if (gen === _playGen) clearPlaybackState()
       pollTimer.restart()
+      if (root._volumeGeneration === volumeGen) {
+        root._resetVolumeForOutput()
+        root.refreshVolume()
+      }
       if (callback) callback(true, "")
+      Qt.callLater(_drainPendingOutputSwitch)
     })
-    logEvent("selectDlnaOutput", selector + (queued ? "" : " (DROPPED: output process busy)"))
+    if (!queued) _finishOutputSwitchFailure(callback, "output process is busy")
+    logEvent("selectDlnaOutput", selector + (queued ? "" : " (could not start: output process busy)"))
   }
 
 
@@ -1388,9 +1666,13 @@ Item {
       }
       if (exitCode !== 0) {
         if (cb) cb(null, String(outputErr.text || "output switch failed").replace(/^dromify-(output|dlna|player):\s*/, "").trim())
+        Qt.callLater(root._drainPendingOutputSwitch)
+        Qt.callLater(root._drainVolumeRequests)
         return
       }
       if (cb) cb(data, "")
+      Qt.callLater(root._drainPendingOutputSwitch)
+      Qt.callLater(root._drainVolumeRequests)
     }
   }
 

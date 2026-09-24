@@ -135,6 +135,11 @@ automatically) or Navidrome's own `ND_TLSCERT` / `ND_TLSKEY` work equally well.
 The speaker icon in the panel header opens **Output**. *This Computer* is the
 default and plays through mpv exactly as before; any UPnP MediaRenderer found
 on the LAN is listed below it, with **Refresh devices** to sweep again.
+The same popup controls the selected output's volume. Local playback uses
+mpv's 0–100 range; DLNA uses the range and step advertised by the renderer,
+or native-value steps when the renderer does not publish a maximum. A renderer
+without UPnP RenderingControl volume actions cannot be adjusted here; one that
+only reports volume shows it as read-only.
 
 Pick a renderer and the next track you play goes to it. Your server serves the
 audio directly — the speaker does its own HTTP fetch — so nothing is

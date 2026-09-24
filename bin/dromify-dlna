@@ -17,7 +17,7 @@ Verbs
   load-queue <startIndex> <count>     queue JSON on stdin (see below)
   reorder-tail <count>                queue JSON on stdin
   next | previous | pause | resume | toggle-pause | stop | quit
-  seek <seconds> | volume <0-100> | set-repeat <off|all|one>
+  seek <seconds> | volume [<device-value>] | set-repeat <off|all|one>
   status                              transport snapshot (JSON)
   capabilities                        what the renderer says it can do
   discover-cache                      cached device list, no network
@@ -901,10 +901,55 @@ def cmd_volume(args) -> None:
     renderer = renderer_for(state)
     if not renderer:
         fail("no renderer selected")
-    if not renderer.set_volume(int(args.value)):
-        out({"ok": False, "error": "SetVolume failed (no RenderingControl?)"})
+
+    volume_info = renderer.volume_info()
+    if not renderer.rc or (volume_info is not None and not volume_info["get"]):
+        if args.value is None:
+            out({"ok": True, "supported": False, "volume": None,
+                 "minimum": 0, "maximum": None, "step": 1})
+            return
+        out({"ok": False, "supported": False,
+             "error": "renderer does not expose GetVolume/SetVolume"})
+        raise SystemExit(1)
+
+    if args.value is None:
+        value = renderer.volume()
+        if value is None:
+            out({"ok": False, "supported": True, "error":
+                 "could not read volume from renderer"})
+            raise SystemExit(1)
+        value_range = volume_info["range"] if volume_info else None
+        out({"ok": True, "supported": True, "volume": value,
+             "minimum": value_range[0] if value_range else 0,
+             "maximum": value_range[1] if value_range else None,
+             "step": value_range[2] if value_range else 1,
+             "adjustable": volume_info["set"] if volume_info else True})
         return
-    out({"ok": True})
+
+    if volume_info is not None and not volume_info["set"]:
+        out({"ok": False, "supported": True, "adjustable": False,
+             "error": "renderer does not expose SetVolume"})
+        raise SystemExit(1)
+
+    value = int(args.value)
+    if not 0 <= value <= 65535:
+        fail("volume must be a non-negative UPnP ui2 value")
+    value_range = volume_info["range"] if volume_info else None
+    if value_range:
+        minimum, maximum, step = value_range
+        if value < minimum or (maximum is not None and value > maximum):
+            if maximum is None:
+                fail("volume must be at least %d for this renderer" % minimum)
+            fail("volume must be between %d and %d for this renderer"
+                 % (minimum, maximum))
+        if (value - minimum) % step != 0:
+            fail("volume must use steps of %d from %d for this renderer"
+                 % (step, minimum))
+    if not renderer.set_volume(value):
+        out({"ok": False, "supported": True,
+             "error": "SetVolume failed for this renderer"})
+        raise SystemExit(1)
+    out({"ok": True, "volume": value})
 
 
 def cmd_set_repeat(args) -> None:
@@ -1110,7 +1155,7 @@ def main() -> None:
     p.set_defaults(func=cmd_seek)
 
     p = sub.add_parser("volume")
-    p.add_argument("value")
+    p.add_argument("value", nargs="?", type=int)
     p.set_defaults(func=cmd_volume)
 
     p = sub.add_parser("set-repeat")

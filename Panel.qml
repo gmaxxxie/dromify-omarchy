@@ -1245,7 +1245,7 @@ Panel {
     bar: root.bar
     open: false
     contentWidth: fittedContentWidth(Style.space(380))
-    contentHeight: fittedContentHeight(outputColumn.implicitHeight, Style.space(560))
+    contentHeight: fittedContentHeight(outputColumn.implicitHeight, Style.space(640))
 
     ColumnLayout {
       id: outputColumn
@@ -1332,6 +1332,138 @@ Panel {
         }
       }
 
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(2)
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Text {
+            textFormat: Text.PlainText
+            text: "Volume"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+          Item { Layout.fillWidth: true }
+          Text {
+            textFormat: Text.PlainText
+            visible: nav.volumeLoaded && nav.volumeSupported
+            text: nav.volumeRangeAdjustable
+              ? Math.round(volumeSlider.dragging ? volumeSlider.liveValue : nav.volumePercent) + "%"
+              : String(nav.volume)
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          PanelActionButton {
+            visible: nav.volumeError !== ""
+            iconText: "󰑐"
+            tooltipText: "Retry volume"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: nav.refreshVolume()
+          }
+        }
+
+        PanelSlider {
+          id: volumeSlider
+          visible: nav.volumeLoaded && nav.volumeSupported
+                   && nav.volumeAdjustable && nav.volumeRangeAdjustable
+          bar: root.bar
+          Layout.fillWidth: true
+          minimum: 0
+          maximum: 100
+          step: 1
+          integer: true
+          value: nav.volumePercent
+          onReleased: function(v) { nav.setVolumePercent(v) }
+        }
+
+        RowLayout {
+          visible: nav.volumeLoaded && nav.volumeSupported && nav.volumeAdjustable
+                   && !nav.volumeRangeKnown
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: "Device range unavailable; adjust in steps"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          PanelActionButton {
+            iconText: "−"
+            tooltipText: "Decrease volume"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: nav.setVolume(nav.volume - 5 * nav.volumeStep)
+          }
+          PanelActionButton {
+            iconText: "+"
+            tooltipText: "Increase volume"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: nav.setVolume(nav.volume + 5 * nav.volumeStep)
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: nav.volumeOutputSwitchPending
+                   || (nav.volumeLoading && !nav.volumeLoaded)
+          text: nav.volumeOutputSwitchPending ? "Switching output…"
+                                              : "Reading output volume…"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: nav.volumeLoaded && !nav.volumeSupported
+          text: "This output does not expose volume control"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: nav.volumeLoaded && nav.volumeSupported
+                   && nav.volumeAdjustable && nav.volumeRangeKnown
+                   && !nav.volumeRangeAdjustable
+          text: "This output has a fixed volume level"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: nav.volumeLoaded && nav.volumeSupported && !nav.volumeAdjustable
+          text: "This output reports volume but does not allow changing it"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: nav.volumeError !== ""
+          text: nav.volumeError
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+      }
+
       Text {
         textFormat: Text.PlainText
         visible: nav.dlnaActive
@@ -1346,7 +1478,10 @@ Panel {
 
     // Refresh on open: renderers come and go, and the list is cheap from cache
     // with the sweep running behind it.
-    onOpenChanged: if (open) nav.refreshDevices()
+    onOpenChanged: if (open) {
+      nav.refreshDevices()
+      nav.refreshVolume()
+    }
   }
 
   component OutputRow: CursorSurface {

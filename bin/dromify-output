@@ -14,6 +14,8 @@
 #   dromify-output output local
 #   dromify-output output dlna <udn|name|index>
 #   dromify-output devices [--json]
+#   dromify-output get-volume              # -> current output's native range/value
+#   dromify-output volume <device-value>   # set current output's native value
 #   dromify-output configure --bridge auto|off
 #   dromify-output <any dromify-player / dromify-dlna verb> [args...]
 #
@@ -189,12 +191,28 @@ case "${1:-}" in
     shift
     exec python3 "$DLNA" capabilities "$@"
     ;;
+  get-volume)
+    if [[ "$(current_output)" == "dlna" ]]; then
+      exec python3 "$DLNA" volume
+    fi
+    "$PLAYER" ensure >/dev/null || fail "could not start the local player"
+    "$PLAYER" status | jq -ce \
+      '{ok:true,supported:true,volume:(.volume // 100),minimum:0,maximum:100}'
+    ;;
+  volume)
+    shift
+    if [[ "$(current_output)" == "dlna" ]]; then
+      exec python3 "$DLNA" volume "$@"
+    fi
+    "$PLAYER" ensure >/dev/null || fail "could not start the local player"
+    exec "$PLAYER" volume "$@"
+    ;;
   status)
     shift
     status "$@"
     ;;
   "")
-    fail "usage: dromify-output <status|output|devices|configure|capabilities|load-queue|next|previous|pause|resume|toggle-pause|seek|volume|set-repeat|stop|quit>"
+    fail "usage: dromify-output <status|output|devices|configure|capabilities|get-volume|volume|load-queue|next|previous|pause|resume|toggle-pause|seek|set-repeat|stop|quit>"
     ;;
   *)
     # Everything else is a transport verb for whichever backend is active.

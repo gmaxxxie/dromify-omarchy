@@ -785,6 +785,7 @@ def describe_device(info: dict) -> dict:
         "avTransportControlURL": services.get(AVTRANSPORT, {}).get("controlURL", ""),
         "avTransportEventURL": services.get(AVTRANSPORT, {}).get("eventSubURL", ""),
         "renderingControlURL": services.get(RENDERING_CONTROL, {}).get("controlURL", ""),
+        "renderingControlSCPDURL": services.get(RENDERING_CONTROL, {}).get("SCPDURL", ""),
         "connectionManagerURL": services.get(CONNECTION_MANAGER, {}).get("controlURL", ""),
         "services": sorted(services.keys()),
     }
@@ -948,6 +949,104 @@ class Renderer:
             return int(fields["CurrentVolume"])
         except ValueError:
             return None
+
+    def _rendering_control_scpd(self) -> ET.Element | None:
+        scpd_url = self.device.get("renderingControlSCPDURL", "")
+        if not scpd_url and self.device.get("location"):
+            info = fetch_description(self.device["location"], timeout=3.0)
+            if info:
+                scpd_url = info.get("services", {}).get(RENDERING_CONTROL, {}).get(
+                    "SCPDURL", "")
+        if not scpd_url:
+            return None
+
+        status, body = http_get(scpd_url, timeout=3.0, max_bytes=256 * 1024)
+        if status != 200:
+            return None
+        try:
+            return ET.fromstring(body)
+        except ET.ParseError:
+            return None
+
+    def volume_info(self) -> dict | None:
+        """Return volume actions and the declared Master range, if available.
+
+        UPnP RenderingControl volume units are vendor-defined. Read the
+        `GetVolume` state variable's range and step from the service
+        description instead of assuming every renderer uses 0–100. Some
+        devices omit the maximum; callers can still offer relative steps.
+        """
+        root = self._rendering_control_scpd()
+        if root is None:
+            return None
+
+        actions: set[str] = set()
+        related_name = ""
+        for action in root.iter():
+            if _localname(action.tag) != "action":
+                continue
+            action_name = next((
+                (child.text or "").strip()
+                for child in action if _localname(child.tag) == "name"
+            ), "")
+            if action_name:
+                actions.add(action_name)
+            if action_name != "GetVolume":
+                continue
+            for arg in action.iter():
+                if _localname(arg.tag) != "argument":
+                    continue
+                fields = {
+                    _localname(child.tag): (child.text or "").strip()
+                    for child in arg
+                }
+                if fields.get("name") == "CurrentVolume":
+                    related_name = fields.get("relatedStateVariable", "")
+                    break
+
+        get_supported = "GetVolume" in actions and bool(related_name)
+        value_range = None
+        for variable in root.iter():
+            if _localname(variable.tag) != "stateVariable":
+                continue
+            name = next((
+                (child.text or "").strip()
+                for child in variable if _localname(child.tag) == "name"
+            ), "")
+            if name != related_name or not related_name:
+                continue
+            allowed_range = next((
+                child for child in variable
+                if _localname(child.tag) == "allowedValueRange"
+            ), None)
+            if allowed_range is None:
+                break
+            fields = {
+                _localname(child.tag): (child.text or "").strip()
+                for child in allowed_range
+            }
+            try:
+                minimum = int(fields.get("minimum", "0"))
+                maximum = int(fields["maximum"]) if fields.get("maximum") else None
+                step = int(fields.get("step", "1"))
+            except ValueError:
+                return None
+            if (minimum < 0 or minimum > 65535 or step < 1 or step > 65535
+                    or (maximum is not None
+                        and (maximum < minimum or maximum > 65535))):
+                break
+            value_range = (minimum, maximum, step)
+            break
+        return {
+            "get": get_supported,
+            "set": "SetVolume" in actions,
+            "range": value_range,
+        }
+
+    def volume_range(self) -> tuple[int, int | None, int] | None:
+        """Return the renderer's declared Master volume range, if available."""
+        info = self.volume_info()
+        return info["range"] if info else None
 
     def set_volume(self, value: int) -> bool:
         if not self.rc:
