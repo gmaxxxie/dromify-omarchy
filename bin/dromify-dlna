@@ -119,12 +119,20 @@ def load_cache() -> dict:
         return {}
 
 
-def save_cache(devices: list[dict]) -> None:
+def save_cache(devices: list[dict], at: float | None = None) -> None:
+    """Write the renderer cache.
+
+    `at` is the sweep time the freshness check in discover() compares against;
+    it defaults to now. A write that is not a new sweep passes the previous
+    value, so refreshing a device's liveness cannot make the cache look freshly
+    swept.
+    """
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     tmp = "%s.tmp.%d" % (CACHE_FILE, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump({"at": time.time(), "devices": devices}, handle)
+        json.dump({"at": time.time() if at is None else at,
+                   "devices": devices}, handle)
     os.replace(tmp, CACHE_FILE)
 
 
@@ -271,19 +279,26 @@ def verify_device(device: dict, timeout: float = 3.0) -> bool:
     return ok
 
 
-def verify_devices(devices: list[dict], timeout: float = 3.0) -> list[dict]:
-    """Probe every cached device concurrently; keep the ones that answered."""
+def split_by_reachability(
+        devices: list[dict],
+        timeout: float = 3.0) -> tuple[list[dict], list[dict]]:
+    """Probe every cached device concurrently, as (reachable, unreachable).
+
+    Both lists keep the input order. The unreachable ones are deliberately not
+    treated as disposable: the caller withholds them from its usable list but
+    must keep them in the cache — see discover().
+    """
     if not devices:
-        return []
+        return [], []
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(8, len(devices))) as pool:
         alive = list(pool.map(lambda d: verify_device(d, timeout), devices))
-    kept = [device for device, ok in zip(devices, alive) if ok]
-    for device, ok in zip(devices, alive):
-        if not ok:
-            dlna.log("dropping %s: control endpoint did not answer"
-                     % device.get("name", "?"))
-    return kept
+    reachable = [device for device, ok in zip(devices, alive) if ok]
+    unreachable = [device for device, ok in zip(devices, alive) if not ok]
+    for device in unreachable:
+        dlna.log("%s did not answer; retaining it as a unicast probe target"
+                 % device.get("name", "?"))
+    return reachable, unreachable
 
 
 def discover(timeout: float = DEFAULT_TIMEOUT, refresh: bool = False,
@@ -298,6 +313,14 @@ def discover(timeout: float = DEFAULT_TIMEOUT, refresh: bool = False,
     other disappear from the picker. Devices are kept for DEVICE_TTL and
     re-confirmed by the next sweep; `select` validates against the device's
     own control endpoint, so a stale entry fails loudly instead of silently.
+
+    Only devices that just answered on their control endpoint are *returned*.
+    One that did not answer is withheld from the returned list but stays in the
+    cache, marked `unreachableAt`: its `location` is what makes the unicast
+    M-SEARCH probe possible, and that probe is the only reliable way to find a
+    renderer whose SSDP responder is lossy once it comes back. Deleting it here
+    would discard the hint at exactly the moment it is needed. See
+    known_hosts().
     """
     cache = load_cache()
     fresh = cache.get("devices", [])
@@ -316,10 +339,22 @@ def discover(timeout: float = DEFAULT_TIMEOUT, refresh: bool = False,
     # sweep: SSDP may have missed a device this round, but a device that still
     # answers must not disappear from the picker because of it.
     if verify and fresh:
-        verified = verify_devices(fresh)
-        if len(verified) != len(fresh):
-            save_cache(verified)
-        fresh = verified
+        before = json.dumps(fresh, sort_keys=True)
+        reachable, unreachable = split_by_reachability(fresh)
+        now = time.time()
+        for device in reachable:
+            # A device that answered is by definition seen now. Without this it
+            # could sit there reachable and still age out of DEVICE_TTL.
+            device["seen"] = now
+            device.pop("unreachableAt", None)
+        for device in unreachable:
+            device["unreachableAt"] = now
+        updated = reachable + unreachable
+        if json.dumps(updated, sort_keys=True) != before:
+            # Written with the previous sweep time: refreshing liveness is not
+            # a sweep, so it must not reset the freshness check above.
+            save_cache(updated, at=cache.get("at", 0))
+        fresh = reachable
     return [device for device in fresh
             if time.time() - device.get("seen", 0) < DEVICE_TTL]
 
@@ -1098,9 +1133,12 @@ def cmd_status(args) -> None:
 
 
 def cmd_discover_cache(args) -> None:
+    # Cache only, no network. Entries that did not answer on the last check are
+    # withheld here too, so this path cannot advertise a renderer that is off.
     cache = load_cache()
-    out({"ok": True, "at": cache.get("at", 0),
-         "devices": cache.get("devices", [])})
+    devices = [device for device in cache.get("devices", [])
+               if not device.get("unreachableAt")]
+    out({"ok": True, "at": cache.get("at", 0), "devices": devices})
 
 
 def main() -> None:
