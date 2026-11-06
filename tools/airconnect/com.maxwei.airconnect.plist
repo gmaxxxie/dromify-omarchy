@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.maxwei.airconnect</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/airconnect/AirConnect.app/Contents/Resources/airupnp-raw</string>
+    <string>-Z</string>
+    <string>-x</string>
+    <string>__HOME__/airconnect/AirConnect.app/Contents/Resources/config.xml</string>
+    <string>-b</string>
+    <string>__LAN_IP__</string>
+    <string>-c</string>
+    <string>pcm</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/airconnect-launchd.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/airconnect-launchd.log</string>
+</dict></plist>

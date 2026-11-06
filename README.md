@@ -241,6 +241,11 @@ bin/dromify-output devices
 See [docs/dlna-output.md](docs/dlna-output.md) for how the DLNA output is
 put together and the measurements that shaped it.
 
+The mirror case — casting to a renderer from outside Dromify, AirPlay 1 in and
+DLNA out on the same speaker — is documented in
+[docs/airconnect-macos.md](docs/airconnect-macos.md), with the setup and
+diagnostic scripts under [tools/airconnect/](tools/airconnect/).
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
